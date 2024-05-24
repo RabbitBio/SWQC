@@ -47,8 +47,8 @@ namespace rabbit {
             part_pool availablePartsPool;
             part_pool allocatedPartsPool;
 
-            th::mutex mutex;
-            th::condition_variable partsAvailableCondition;
+            //th::mutex mutex;
+            //th::condition_variable partsAvailableCondition;
 
         public:
             volatile uint32 partNum;
@@ -80,10 +80,10 @@ namespace rabbit {
              * @param part_ the pointer to acquireed space
              */
             void Acquire(DataType *&part_) {
-                th::unique_lock<th::mutex> lock(mutex);
+                //th::unique_lock<th::mutex> lock(mutex);
 
                 while (partNum >= maxPartNum) {
-                    partsAvailableCondition.wait(lock);
+                    //partsAvailableCondition.wait(lock);
                 }
                 ASSERT(availablePartsPool.size() > 0);
 
@@ -106,7 +106,7 @@ namespace rabbit {
              * @param part_ the pointer to be realesed to DataPool
              */
             void Release(const DataType *part_) {
-                th::lock_guard<th::mutex> lock(mutex);
+                //th::lock_guard<th::mutex> lock(mutex);
 
                 ASSERT(part_ != NULL);
                 ASSERT(partNum != 0 && partNum <= maxPartNum);
@@ -115,7 +115,7 @@ namespace rabbit {
                 availablePartsPool.push_back((DataType *) part_);
                 partNum--;
 
-                partsAvailableCondition.notify_one();
+                //partsAvailableCondition.notify_one();
             }
         };
 

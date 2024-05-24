@@ -1,33 +1,30 @@
-## ![logo](./pics/RabbitQCPlus.png)
 
-# RabbitQCPlus Features
+# SWQC Features
 
-A modern quality control tool for sequencing data.
-- Single-threaded performance is improved by a factor of 2 at least.
+The first versatile, distributed, and highly efficient sequencing data quality control software on the Sunway platform.
 
-- Solving the performance issues when processing gz files (more than 4x speedups compared with SOAPnuke).
+- Implemented a distributed FASTQ file IO framework that supports multi-threaded (de)compression based on the Sunway platform.
 
-- Improving the efficiency of the time-consuming over-representation module by a factor of 5.
+- The single-node version is 1.5-3 times faster than the fastest software on x86 platform and 5-20 times faster than the non-optimized Sunway version.
+
+- The multi-node version achieves 65%-80% scalability on 16 nodes.
 
 # Build
 
-RabbitQCPlus can only support 64-bit Linux Systems.
+SWQC can only support the next-generation Sunway platform.
 
 ### Dependancy
 
-- gcc 4.8.5 or newer
-- [zlib](https://zlib.net/)
+- sw9gcc (7.1.0 or newer) 
+- zlib
 
 ### Compilation
 
 ```bash
-git clone https://github.com/RabbitBio/RabbitQCPlus.git
-cd RabbitQCPlus
+git clone https://github.com/RabbitBio/SWQC.git
+cd SWQC 
 make -j4
 ```
-To improve the robustness of the software, we have implemented different software versions for different vectorized instruction sets. RabbitQCPlus can automatically detect the system CPU instruction set and compiler version at compile time to select the appropriate software version.
-
-You can also specify the instruction set you want to use by manually modifying the ``InstructSet`` in the ``Makefile``. ``-DVec512`` means using the avx512 instruction set, and ``-DVec256`` means using the avx2 instruction set; otherwise, let the compiler choose.
 
 # Simple usage
 
@@ -36,67 +33,34 @@ You can also specify the instruction set you want to use by manually modifying t
 - For SE (not compressed)
 
 ```bash
-./RabbitQCPlus -w 8 -i in1.fastq -o p1.fastq
+./SWQC -i in1.fastq -o p1.fastq
 ```
 
 - For SE (gzip compressed)
 
 ```bash
-./RabbitQCPlus -w 8 -i in1.fastq.gz -o p1.fastq.gz
+./SWQC -i in1.fastq.gz -o p1.fastq.gz
 ```
 
 - For PE (not compressed)
 
 ```bash
-./RabbitQCPlus -w 8 -i in1.fastq -I in2.fastq -o p1.fastq -O p2.fastq
+./SWQC -i in1.fastq -I in2.fastq -o p1.fastq -O p2.fastq
 ```
 
 - For PE (gzip compressed)
 
 ```bash
-./RabbitQCPlus -w 16 -i in1.fastq.gz  -I in2.fastq.gz -o p1.fastq.gz -O p2.fastq.gz
-```
-
-## For third generation sequencing data
-
-- not compressed
-
-```bash
-./RabbitQCPlus -w 4 -i in.fastq --TGS
-```
-
-- gzip compressed
-
-```bash
-./RabbitQCPlus -w 6 -i in.fastq.gz --TGS
+./SWQC -i in1.fastq.gz -I in2.fastq.gz -o p1.fastq.gz -O p2.fastq.gz
 ```
 
 # Options
 
-For more help information, please refer to `./RabbitQCPlus -h`.
+For more help information, please refer to `./SWQC -h`.
 
 
-
-# Performance results
-
-Experiments have been conducted on a Linux server with 2 Intel Xeon Platinum 8260 CPUs, 1.5T RAM, 2T SSD, running Ubuntu 20.04 and GCC9. We have compared the performance of RabbitQCPlus with RabbitQC (v0.0.1), fastp (v0.23.2), SOAPnuke (v2.1.7), Trimmomatic (v0.40), and FASTQC (v0.11.9) using 370 million Illumina sequencing reads ([SRR7963242](https://www.ncbi.nlm.nih.gov/sra/?term=SRR7963242)).
-
-We use default parameters of each application except for the number of threads on both plain and gzip-compressed FASTQ files.
-When using default parameters, RabbitQCPlus performs the same or more comprehensive quality control operations compared to other applications.
-
-## Plain FASTQ files
-
-<img src="pics/plain.png" alt="plain" style="zoom:50%;" />
-
-## Gzip-compressed FASTQ files
-
-<img src="pics/gzip.png" alt="gzip" style="zoom:50%;" />
 
 # Visual output
 
 We visualized the information before and after data filtering, and [here](https://yanlifeng.github.io/someTest/example.html) is an example.
 
-# Citation
-Lifeng Yan, Zekun Yin, Hao Zhang, Zhan Zhao, Mingkai Wang, André Müller, Robin Kobus, Yanjie Wei, Beifang Niu, Bertil Schmidt, Weiguo Liu. RabbitQCPlus: More Efficient Quality Control for Sequencing Data, 2022 IEEE International Conference on Bioinformatics and Biomedicine (BIBM), to appear
-
-Zekun Yin, Hao Zhang, Meiyang Liu, Wen Zhang, Honglei Song, Haidong Lan, Yanjie Wei, Beifang Niu, Bertil Schmidt, Weiguo Liu, RabbitQC: High-speed scalable quality control for sequencing data, Bioinformatics, , btaa719, https://doi.org/10.1093/bioinformatics/btaa719

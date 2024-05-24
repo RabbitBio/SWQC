@@ -30,11 +30,9 @@ OBJ += $(patsubst %.c,${DIR_OBJ}/slave_%.o,$(notdir ${SRC4}))
 
 
 
-TARGET := RabbitQCPlus
-TARGET_MPI := RabbitQCPlus_mpi
+TARGET := SWQC 
 
 BIN_TARGET := ${TARGET}
-BIN_TARGET_MPI := ${TARGET_MPI}
 
 
 CXX = mpicxx
@@ -55,13 +53,9 @@ LIBS := -static -lz -lpthread -lrt
 
 LD_FLAGS := $(foreach librarydir,$(LIBRARY_DIRS),-L$(librarydir)) $(LIBS)
 
-#all: ${BIN_TARGET} ${BIN_TARGET_MPI}
-all: ${BIN_TARGET_MPI}
+all: ${BIN_TARGET}
 
 ${BIN_TARGET}:${OBJ}
-		$(CXX) -mhybrid $^ -o $@ $(LD_FLAGS)
-
-${BIN_TARGET_MPI}: ${OBJ}
 		$(CXX) -mhybrid $^ -o $@ $(LD_FLAGS)
 
 ${DIR_OBJ}/%.o:${DIR_SRC}/%.cpp
@@ -80,8 +74,7 @@ $(DIR_OBJ)/slave_%.o: ${SLAVE_DIR_SRC}/lib/%.c
 .PHONY:clean
 clean:
 	rm -rf $(DIR_OBJ)/*.o
-	#rm -rf $(TARGET)
-	rm -rf $(TARGET_MPI)
+	rm -rf $(TARGET)
 
 install:
 	install $(TARGET) $(BINDIR)/$(TARGET)

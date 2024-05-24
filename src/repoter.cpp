@@ -112,7 +112,7 @@ std::string HTMLHeader() {
                        "<html lang=\"en\">\n"
                        "<head>\n"
                        "    <meta charset=\"UTF-8\">\n"
-                       "    <title>RabbitQCPlus report</title>\n"
+                       "    <title>SWQC report</title>\n"
                        "    <script>" +
                        jsInfo + "</script>\n"
                                 "</head>\n"
@@ -685,7 +685,7 @@ void Repoter::ReportHtmlTGS(std::string html_name, std::string command, TGSStats
     outhtml.append(insertTableBegin());
     outhtml.append(insertTableTitle("", "General(TGS)"));
     outhtml.append(insertTableTbobyBegin());
-    outhtml.append(insertTableTr("RabbitQCPlus version:", "0.0.2"));
+    outhtml.append(insertTableTr("SWQC version:", "0.0.2"));
     outhtml.append(insertTableTr("FileName", file_name));
     outhtml.append(insertTableTr("Command", command));
     outhtml.append(insertTableTr("ReadsNumber", std::to_string(readsNum)));
@@ -1062,7 +1062,7 @@ void Repoter::ReportHtmlSe(std::string html_name, State *state1, State *state2, 
     outhtml.append(insertTableBeginFloatBig());
     outhtml.append(insertTableTitle("General", ""));
     outhtml.append(insertTableTbobyBegin());
-    outhtml.append(insertTableTr("RabbitQCPlus version:", "0.0.2"));
+    outhtml.append(insertTableTr("SWQC version:", "0.0.2"));
     outhtml.append(insertTableTr("FileName", file_name));
     outhtml.append(insertTableTr("Command", command));
     outhtml.append(
@@ -1433,7 +1433,7 @@ void Repoter::ReportHtmlPe(std::string html_name, State *pre_state1, State *pre_
     outhtml.append(insertTableBeginFloatBig());
     outhtml.append(insertTableTitle("General", ""));
     outhtml.append(insertTableTbobyBegin());
-    outhtml.append(insertTableTr("RabbitQCPlus version:", "0.0.2"));
+    outhtml.append(insertTableTr("SWQC version:", "0.0.2"));
     outhtml.append(insertTableTr("FileName", file_name1 + "," + file_name2));
     outhtml.append(insertTableTr("Command", command));
     outhtml.append(

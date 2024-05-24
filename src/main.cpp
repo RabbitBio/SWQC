@@ -66,7 +66,7 @@ int main(int argc, char **argv) {
     //if(my_rank == 0) freopen("dev/null", "w", stdout);
     srand(time(0));
     CmdInfo cmd_info;
-    CLI::App app("RabbitQCPlus");
+    CLI::App app("SWQC");
     app.add_option("-i,--inFile1", cmd_info.in_file_name1_, "input fastq name 1");
     app.add_option("-I,--inFile2", cmd_info.in_file_name2_, "input fastq name 2");
     app.add_option("-o,--outFile1", cmd_info.out_file_name1_, "output fastq name 1");
@@ -79,6 +79,7 @@ int main(int argc, char **argv) {
     int aaaa;
     app.add_flag("--overWrite", cmd_info.overWrite_, "overwrite out file if already exists.");
     app.add_flag("--swpdb", aaaa, "overwrite out file if already exists.");
+    app.add_flag("--splitWrite", cmd_info.splitWrite_, "write split file when using multi-nodes.");
     app.add_flag("--phred64", cmd_info.isPhred64_, "input is using phred64 scoring, default is phred33");
     app.add_flag("--stdin", cmd_info.isStdin_,
             "input from stdin, or -i /dev/stdin, only for se data or interleaved pe data(which means use --interleavedIn)");
@@ -237,6 +238,15 @@ int main(int argc, char **argv) {
     //}
 
     if (tmp_no_dup_)cmd_info.state_duplicate_ = false;
+
+    if(cmd_info.splitWrite_) {
+        cmd_info.out_file_name1_ = "rank" + to_string(my_rank) + "_" + cmd_info.out_file_name1_;
+        printf("now use split write module, %s\n", cmd_info.out_file_name1_.c_str());
+        if(cmd_info.out_file_name2_.length()) {
+            cmd_info.out_file_name2_ = "rank" + to_string(my_rank) + "_" + cmd_info.out_file_name2_;
+            printf("now use split write module, PE, %s\n", cmd_info.out_file_name2_.c_str());
+        }
+    }
 
     if (cmd_info.is_TGS_) {
         if (cmd_info.in_file_name2_.length() > 0) {
