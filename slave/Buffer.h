@@ -33,6 +33,8 @@ namespace rabbit {
             /// return the pointer of buffer
             byte *Pointer() const { return (byte *) buffer; }
 
+            byte *PointerAlign() const { return ((byte *) buffer) + offset_align; }
+
 #if (USE_64BIT_MEMORY)
 
             uint64 *Pointer64() const { return buffer; }
@@ -52,6 +54,8 @@ namespace rabbit {
             byte *buffer;
 #endif
             uint64 size;
+        public:
+            uint64 offset_align;
         };
 
 /**

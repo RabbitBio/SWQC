@@ -306,6 +306,17 @@ namespace rabbit {
             int64 MemDataTotSize = 0;
             int64 MemDataNowPos = 0;
             bool MemDataReadFinish = 0;
+            
+            int read_cnt = 0;
+            
+            int64_t endAlignPos = 0;
+            int64_t endAlignPos2 = 0;
+
+            int64_t nowAlignPos = 0;
+            int64_t nowAlignPos2 = 0;
+            
+            int64_t nowAlignEnd = 0;
+            int64_t nowAlignEnd2 = 0;
 
             byte* MemData2;
             int64 MemDataTotSize2 = 0;
@@ -334,6 +345,12 @@ namespace rabbit {
                   recordsPool(pool_) {
                 GetNxtBuffSize = mxLen_;
                 tot_read_size2 = 0;
+                endAlignPos = endPos;
+                endAlignPos2 = endPos;
+                nowAlignPos = startPos; 
+                nowAlignPos2 = startPos; 
+                nowAlignEnd = startPos; 
+                nowAlignEnd2 = startPos; 
                 mFqReader = new FileReader(fileName_, isZipped, startPos, endPos, inMem);
                 if (fileName2_ != "") {
                     mFqReader2 = new FileReader(fileName2_, isZipped, startPos, endPos, inMem);
@@ -395,6 +412,8 @@ namespace rabbit {
             // added from fastxIO.h
             FastqDataChunk *readNextChunk();
 
+            FastqDataChunk *readNextChunkAlign();
+
             FastqDataChunk *readNextChunkFromMem(int64 offset = -1, int64 lim_size = 1e9);
 
             FastqDataChunk *readNextInterChunk();
@@ -402,6 +421,8 @@ namespace rabbit {
             void readChunk();
 
             bool ReadNextChunk_(FastqDataChunk *chunk_);
+
+            bool ReadNextChunkAlign_(FastqDataChunk *chunk_);
 
             bool ReadNextChunkFromMem_(FastqDataChunk *chunk_, int64 offset = -1, int64 lim_size = 1e9);
             

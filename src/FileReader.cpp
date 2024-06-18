@@ -1,9 +1,13 @@
 #include "FileReader.h"
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
+
 
 extern "C" {
 #include <athread.h>
 #include <pthread.h>
-void slave_decompressfunc();
+    void slave_decompressfunc();
 }
 #define USE_LIBDEFLATE
 namespace rabbit {
@@ -13,6 +17,10 @@ namespace rabbit {
         read_times = 0;
         start_pos = 0;
         end_pos = 0;
+        t_memcpy = 0;
+        t_read = 0;
+        MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+
         if (ends_with(fileName_, ".gz") || isZipped) {
 #ifdef USE_LIBDEFLATE
             start_line = startPos;
@@ -38,6 +46,7 @@ namespace rabbit {
             }
             iff_idx.close();
 
+
             //std::string index_file_name = fileName_ + ".swidx";
             //int block_size;
             //iff_idx.open(index_file_name);
@@ -53,7 +62,7 @@ namespace rabbit {
             }
             for(int i = 0; i < start_line; i++) start_pos += block_sizes[i];
             for(int i = 0; i < end_line; i++) end_pos += block_sizes[i];
-           // fprintf(stderr, "FileReader zip [%lld %lld] [%d %d]\n", start_pos, end_pos, start_line, end_line);
+            fprintf(stderr, "FileReader zip [%lld %lld] [%d %d]\n", start_pos, end_pos, start_line, end_line);
             now_block = start_line;
             block_sizes.resize(end_line);
             iff_idx_end = 0;
@@ -64,6 +73,9 @@ namespace rabbit {
             to_read_buffer = new char[(64 + 8) * BLOCK_SIZE];
             buffer_tot_size = 0;
             buffer_now_pos = 0;
+            buffer_now_offset = 0;
+            read_cnt = 0;
+            align_end = false;
             input_file = fopen(fileName_.c_str(), "rb");
             if (input_file == NULL) {
                 perror("Failed to open input file");
@@ -74,6 +86,29 @@ namespace rabbit {
                 file_offset += block_sizes[i];
             }
             fseek(input_file, file_offset, SEEK_SET);
+
+            buffer_test = (char*)aligned_alloc(MY_PAGE_SIZE, 8 * 1024 * 1024);
+            if (!buffer_test) {
+                perror("Failed to allocate aligned buffer");
+                exit(1);
+            }
+            buffer_test_last = (char*)aligned_alloc(MY_PAGE_SIZE, 1024 * 1024);
+            if (!buffer_test) {
+                perror("Failed to allocate aligned buffer");
+                exit(1);
+            }
+            buffer_last_size = 0;
+            //TODO
+            buffer_now_offset = file_offset;
+            fprintf(stderr, "rank%d buffer_now_offset %lld\n", my_rank, buffer_now_offset);
+
+            fd = open(fileName_.c_str(), O_RDWR | O_DIRECT);
+            //fd = open(fileName_.c_str(), O_RDWR);
+            if (fd == -1) {
+                perror("Failed to open file");
+                exit(0);
+            }
+
             if (read_in_mem) {
                 MemDataTotSize = end_pos - start_pos;
                 fprintf(stderr, "read_in_mem %s %lld\n", fileName_.c_str(), MemDataTotSize);
@@ -108,11 +143,30 @@ namespace rabbit {
             //fprintf(stderr, "FileReader [%lld %lld]\n", start_pos, end_pos);
             has_read = 0;
             total_read = end_pos - start_pos;
-            mFile = FOPEN(fileName_.c_str(), "rb");
-            if (mFile == NULL) {
-                throw RioException(("Can not open file to read: " + fileName_).c_str());
+            align_end = false;
+
+            buffer_test = (char*)aligned_alloc(MY_PAGE_SIZE, 8 * 1024 * 1024);
+            if (!buffer_test) {
+                perror("Failed to allocate aligned buffer");
+                exit(1);
             }
-            fseek(mFile, start_pos, SEEK_SET);
+
+            fd = open(fileName_.c_str(), O_RDWR | O_DIRECT);
+            //fd = open(fileName_.c_str(), O_RDWR);
+            if (fd == -1) {
+                perror("Failed to open file");
+                exit(0);
+            }
+
+            //TODO 
+            off_t offset = start_pos;
+            if (lseek(fd, offset, SEEK_SET) == (off_t)-1) {
+                perror("lseek error");
+                close(fd);
+                exit(0);
+            }
+
+
             if (read_in_mem) {
                 fprintf(stderr, "read_in_mem %s\n", fileName_.c_str());
                 MemDataTotSize = end_pos - start_pos;
@@ -126,7 +180,7 @@ namespace rabbit {
             }
 
         }
-        //fprintf(stderr, "filereader init done\n");
+        fprintf(stderr, "filereader init done\n");
     }
 
     FileReader::FileReader(int fd, bool isZipped) {
@@ -135,11 +189,19 @@ namespace rabbit {
     }
 
     FileReader::~FileReader() {
+        fprintf(stderr, "time %lf %lf\n", t_memcpy, t_read);
         if (mIgInbuf != NULL) delete mIgInbuf;
         if (read_in_mem) delete[] MemData;
         if (mFile != NULL) {
             fclose(mFile);
             mFile = NULL;
+        }
+        if (fd != -1) {
+            if (close(fd) == -1) {
+                perror("Failed to close file descriptor");
+            } else {
+                fd = -1;
+            }
         }
         if (mZipFile != NULL) {
             gzclose(mZipFile);
@@ -183,7 +245,7 @@ namespace rabbit {
             } else {
                 to_read = block_sizes[now_block++];
             }
-//            fprintf(stderr, "to_read %zu, now_block %d\n", to_read, now_block);
+            //            fprintf(stderr, "to_read %zu, now_block %d\n", to_read, now_block);
             if(read_in_mem) {
                 int64 lastDataSize = MemDataTotSize - MemDataNowPos;
                 if (to_read > lastDataSize) {
@@ -223,6 +285,52 @@ namespace rabbit {
         }
     }
 
+    int64 FileReader::ReadAlign(byte *memory_, int64_t offset_, uint64 size_) {
+        offset_read = offset_;
+        off_t offset = offset_;
+        if (lseek(fd, offset, SEEK_SET) == (off_t)-1) {
+            perror("lseek error");
+            close(fd);
+            exit(0);
+        }
+
+        if(offset_read + size_ > end_pos) size_ = end_pos - offset_;
+        if(size_ % MY_PAGE_SIZE) {
+            size_ = ((size_ / MY_PAGE_SIZE) + 1) * MY_PAGE_SIZE; 
+            fprintf(stderr, "read gg byte, -- %d\n", size_);
+        }
+
+        //fprintf(stderr, "%d == read21 byte, -- %d -- %p\n", int(t_memcpy), size_, memory_);
+
+        double t0 = GetTime();
+        //int n = read(fd, buffer_test, size_);
+        int n = read(fd, memory_, size_);
+        t_read += GetTime() - t0;
+
+        //fprintf(stderr, "read22 %d byte, -- %d\n", n, size_);
+        if (n != (ssize_t)size_) {
+            if (n == 0) {
+                fprintf(stderr, "Reached end of file unexpectedly. Only %zd bytes were read.\n", n);
+            } else if (n == -1) {
+                //fprintf(stderr, "GG1 %zu %d %p\n", size_, n, buffer_test);
+                fprintf(stderr, "GG2 %zu %d %p\n", size_, n, memory_);
+                fprintf(stderr, "Error reading file: %s\n", strerror(errno));
+                exit(0);
+            }
+        }
+        if(offset_read + n >= end_pos) {
+            align_end = true; 
+            n = end_pos - offset_read;
+        } 
+
+        //t0 = GetTime();
+        //memcpy(memory_, buffer_test, n);
+        //t_memcpy += GetTime() - t0;
+
+        return n;
+    }
+
+
 
     int64 FileReader::Read(byte *memory_, uint64 size_) {
         if (isZipped) {
@@ -232,6 +340,7 @@ namespace rabbit {
             if (now_block == end_line) {
                 to_read = 0;
                 iff_idx_end = 1;
+                align_end = true;
             } else {
                 to_read = block_sizes[now_block++];
             }
@@ -253,12 +362,67 @@ namespace rabbit {
                 //fprintf(stderr, "use consumer slave gz in in_mem module is TODO!\n");
                 //exit(0);
             } else {
-                int64 n = fread(memory_, 1, to_read, input_file);
-                assert(n == to_read);
+                int nouse_chunk_size;
+                if(read_cnt == 0) {
+                    nouse_chunk_size = buffer_now_offset % MY_PAGE_SIZE;
+                    buffer_now_offset -= buffer_now_offset % MY_PAGE_SIZE;
+                    to_read += nouse_chunk_size;
+                }
+                
+                off_t offset = buffer_now_offset;
+
+                if (lseek(fd, offset, SEEK_SET) == (off_t)-1) {
+                    perror("lseek error");
+                    close(fd);
+                    exit(0);
+                }
+
+
+                int align_to_read = to_read - buffer_last_size;
+                if(align_to_read % MY_PAGE_SIZE) {
+                    align_to_read = align_to_read - align_to_read % MY_PAGE_SIZE + MY_PAGE_SIZE;
+                }
+                double t0 = GetTime();
+                int n = read(fd, buffer_test, align_to_read);
+                t_read += GetTime() - t0;
+
+                //int n = read(fd, memory_, size_);
+                if (n != (ssize_t)align_to_read) {
+                    if (n == 0) {
+                        fprintf(stderr, "Reached end of file unexpectedly. Only %zd bytes were read.\n", n);
+                    } else if (n == -1) {
+                        fprintf(stderr, "GG1 %zu %d %p\n", align_to_read, n, buffer_test);
+                        fprintf(stderr, "Error reading file: %s\n", strerror(errno));
+                    }
+                }
+    
+                //fprintf(stderr, "rank%d readcnt %d, n %d, align_toread %d, offset %d, to_read %d, buffer_last_size %d\n", my_rank, read_cnt, n, align_to_read, buffer_now_offset, to_read, buffer_last_size);
+                if(read_cnt == 0 && buffer_now_offset != 0) {
+                    t0 = GetTime();
+                    to_read -= nouse_chunk_size; 
+                    memcpy(memory_, buffer_test + nouse_chunk_size, to_read);
+                    buffer_last_size = align_to_read - to_read - nouse_chunk_size;
+                    memcpy(buffer_test_last, buffer_test + to_read + nouse_chunk_size, buffer_last_size);
+                    t_memcpy += GetTime() - t0;
+                    buffer_now_offset += align_to_read;
+                } else {
+                    t0 = GetTime();
+                    memcpy(memory_, buffer_test_last, buffer_last_size);
+                    memcpy(memory_ + buffer_last_size, buffer_test, to_read - buffer_last_size);
+                    int buffer_last_size2 = buffer_last_size;
+                    buffer_last_size = align_to_read - (to_read - buffer_last_size2);
+                    memcpy(buffer_test_last, buffer_test + to_read - buffer_last_size2, buffer_last_size);
+                    t_memcpy += GetTime() - t0;
+                    buffer_now_offset += align_to_read;
+                }
+
+                read_cnt++;
+                //int64 n = fread(memory_, 1, to_read, input_file);
+                //assert(n == to_read);
                 //fprintf(stderr, "nn %lld\n", n);
-                return n;
+                return to_read;
             }
-            
+
 #else
             if (buffer_now_pos + size_ > buffer_tot_size) {
                 DecompressMore();
@@ -301,8 +465,33 @@ namespace rabbit {
                 }
             } else {
                 if(has_read + size_ > total_read) size_ = total_read - has_read;
-                int64 n = fread(memory_, 1, size_, mFile);
-                //fprintf(stderr, "normal read %lld\n", n);
+                if(size_ % MY_PAGE_SIZE) {
+                    size_ = ((size_ / MY_PAGE_SIZE) + 1) * MY_PAGE_SIZE; 
+                    //fprintf(stderr, "read gg byte, -- %d\n", size_);
+                }
+
+                //fprintf(stderr, "read1 byte, -- %d -- %p\n", size_, memory_);
+
+                double t0 = GetTime();
+                int n = read(fd, buffer_test, size_);
+                t_read += GetTime() - t0;
+
+                //int n = read(fd, memory_, size_);
+                fprintf(stderr, "read2 %d byte, -- %d\n", n, size_);
+                if (n != (ssize_t)size_) {
+                    if (n == 0) {
+                        fprintf(stderr, "Reached end of file unexpectedly. Only %zd bytes were read.\n", n);
+                    } else if (n == -1) {
+                        fprintf(stderr, "GG1 %zu %d %p\n", size_, n, buffer_test);
+                        //fprintf(stderr, "GG1 %zu %d %p\n", size_, n, memory_);
+                        fprintf(stderr, "Error reading file: %s\n", strerror(errno));
+                    }
+                }
+
+                t0 = GetTime();
+                memcpy(memory_, buffer_test, n);
+                t_memcpy += GetTime() - t0;
+
                 has_read += n;
                 return n;
             }
@@ -311,17 +500,25 @@ namespace rabbit {
 
     bool FileReader::FinishRead() {
         if (isZipped) {
-            //fprintf(stderr, " finish ? %d--%lld %lld\n", iff_idx_end, buffer_now_pos, buffer_tot_size);
+            //fprintf(stderr, " finish ? %d %d--%lld %lld\n", iff_idx_end, int(align_end), buffer_now_pos, buffer_tot_size);
 #ifdef USE_LIBDEFLATE
             if(read_in_mem) return (iff_idx_end || MemDataReadFinish) && (buffer_now_pos == buffer_tot_size);
+# ifdef use_align_64k
+            else return (iff_idx_end || align_end) && (buffer_now_pos == buffer_tot_size);
+# else
             else return (iff_idx_end || feof(input_file)) && (buffer_now_pos == buffer_tot_size);
+# endif
 #else
             return gzeof(mZipFile);
 #endif
         } else {
             //fprintf(stderr, " finish ? %lld %lld\n", total_read, has_read);
             if (read_in_mem) return MemDataReadFinish;
+#ifdef use_align_64k
+            else return align_end;
+#else
             else return total_read == has_read;
+#endif
         }
     }
 

@@ -391,6 +391,19 @@ namespace rabbit {
                 return NULL;
             }
         }
+
+        FastqDataChunk *FastqFileReader::readNextChunkAlign() {
+            FastqDataChunk *part = NULL;
+            recordsPool.Acquire(part);
+            if (ReadNextChunkAlign_(part)) {
+                return part;
+            } else {
+                recordsPool.Release(part);
+                return NULL;
+            }
+        }
+
+
         FastqDataChunk *FastqFileReader::readNextChunk() {
             FastqDataChunk *part = NULL;
             recordsPool.Acquire(part);
@@ -1134,7 +1147,49 @@ namespace rabbit {
             return true;
         }
 
- 
+  
+        bool FastqFileReader::ReadNextChunkAlign_(FastqDataChunk *chunk_) {
+
+            if (mFqReader->FinishRead()) {
+                chunk_->size = 0;
+                return false;
+            }
+
+            // flush the data from previous incomplete chunk
+            uchar *data = chunk_->data.Pointer();
+            uint64 cbufSize = chunk_->data.Size();
+            chunk_->size = 0;
+            int64 toRead = cbufSize;
+            if(read_cnt == 0) {
+                nowAlignPos -= nowAlignPos % MY_PAGE_SIZE;  
+            }
+            read_cnt++;
+
+            int64 r = mFqReader->ReadAlign(data, nowAlignPos, toRead);
+            if (!mFqReader->FinishRead()) {
+                cbufSize = r;
+                uint64 chunkEnd = cbufSize;
+                chunkEnd = cbufSize - (cbufSize < GetNxtBuffSize ? cbufSize : GetNxtBuffSize);
+                chunkEnd = GetNextRecordPos_(data, chunkEnd, cbufSize);
+                chunk_->data.offset_align = nowAlignEnd - nowAlignPos;
+                nowAlignPos += chunkEnd - chunkEnd % MY_PAGE_SIZE;
+                nowAlignEnd += chunkEnd - chunk_->data.offset_align; 
+                //fprintf(stderr, "111 nowAlignPos: %lld, nowAlignEnd %lld, data.offset_align %lld\n", nowAlignPos, nowAlignEnd, chunk_->data.offset_align);
+                
+                chunk_->size = chunkEnd - 1;
+                if (usesCrlf) chunk_->size -= 1;
+            } else {                  // at the end of file
+                chunk_->data.offset_align = nowAlignEnd - nowAlignPos;
+                //fprintf(stderr, "222 nowAlignPos: %lld, nowAlignEnd %lld, data.offset_align %lld\n", nowAlignPos, nowAlignEnd, chunk_->data.offset_align);
+                chunk_->size += r - 1;// skip the last EOF symbol
+                if (usesCrlf) chunk_->size -= 1;
+                mFqReader->setEof();
+            }
+            return true;
+        }
+
+
+
         bool FastqFileReader::ReadNextChunk_(FastqDataChunk *chunk_) {
 
             if (mFqReader->FinishRead() && bufferSize == 0) {
@@ -1147,6 +1202,7 @@ namespace rabbit {
             uint64 cbufSize = chunk_->data.Size();
             chunk_->size = 0;
             int64 toRead = cbufSize - bufferSize;
+
             //---------------------------------
             if (bufferSize > 0) {
                 std::copy(swapBuffer.Pointer(), swapBuffer.Pointer() + bufferSize, data);
@@ -1162,6 +1218,7 @@ namespace rabbit {
                 if(isZipped) {
 #ifdef USE_CC_GZ
                     chunk_->size = chunkEnd;
+                    //fprintf(stderr, "chunk size %lld\n", chunk_->size);
 #else
                     chunkEnd = cbufSize - (cbufSize < GetNxtBuffSize ? cbufSize : GetNxtBuffSize);
                     chunkEnd = GetNextRecordPos_(data, chunkEnd, cbufSize);

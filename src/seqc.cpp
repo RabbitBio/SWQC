@@ -65,7 +65,7 @@ static bool use_out_mem = 0;
 
 static bool use_swidx_file = 0;
 
-#define use_mpi_file
+//#define use_mpi_file
 
 char* OutMemData;
 
@@ -254,6 +254,7 @@ SeQc::SeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
 
 #ifdef USE_LIBDEFLATE
 
+# ifdef use_mpi_file
                 ofstream file(cmd_info1->out_file_name1_.c_str());
 
                 if (file.is_open()) {
@@ -277,6 +278,20 @@ SeQc::SeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
                     MPI_Abort(MPI_COMM_WORLD, err);
                     exit(0);
                 }
+# else
+                // Other ranks open the file after the barrier
+                fd = open(cmd_info1->out_file_name1_.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0666);
+                //fd = open(cmd_info1->out_file_name1_.c_str(), O_CREAT | O_RDWR, 0666);
+                if (fd < 0) {
+                    perror("Failed to open file");
+                    //free(buffer);
+                    MPI_Abort(MPI_COMM_WORLD, 1);
+                    return;
+                }
+
+
+# endif
+
 #else 
                 zip_out_stream = gzopen(cmd_info1->out_file_name1_.c_str(), "w");
                 gzsetparams(zip_out_stream, cmd_info1->compression_level_, Z_DEFAULT_STRATEGY);
@@ -284,9 +299,7 @@ SeQc::SeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
 #endif
             }
         } else {
-#ifdef Verbose
             printf("open stream %s\n", cmd_info1->out_file_name1_.c_str());
-#endif
 
  
 
@@ -318,28 +331,64 @@ SeQc::SeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
 
 
 #else
-            if(my_rank == 0) {
-                printf("pre real file size %lld\n", real_file_size);
-                int fd = open(cmd_info1->out_file_name1_.c_str(), O_CREAT | O_TRUNC | O_RDWR | O_EXCL, 0644);
-                ftruncate(fd, sizeof(char) * real_file_size);
-                out_stream_ = fdopen(fd, "w");
-            } else {
-                int found = 0;
-                do {
-                    if(-1 == access(cmd_info1->out_file_name1_.c_str(), F_OK)) {
-                        if(ENOENT == errno) {
-                            fprintf(stderr, "rank%d waiting file1\n");
-                            usleep(1000000);
-                        } else {
-                            fprintf(stderr, "rank%d waiting file2\n");
-                            usleep(1000000);
-                        }
-                    } else {
-                        out_stream_ = fopen(cmd_info1->out_file_name1_.c_str(), "r+b");   
-                        found = 1;
-                    }
-                } while(found == 0);
-            }
+
+			// Delete existing file if present
+			//if (my_rank == 0) {
+            //		unlink(cmd_info1->out_file_name1_.c_str());  // Ignore errors, file might not exist
+			//}
+
+			// Barrier to ensure file is deleted before any process tries to create it
+			//MPI_Barrier(MPI_COMM_WORLD);
+
+			//if (my_rank == 0) {
+			//	//printf("real_file_size %lld\n", real_file_size);
+			//	int fd1 = open(cmd_info1->out_file_name1_.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0666);
+			//	//int fd1 = open(cmd_info1->out_file_name1_.c_str(), O_CREAT | O_RDWR, 0666);
+			//	if (fd1 < 0) {
+			//		perror("Failed to open file");
+			//		//free(buffer);
+			//		MPI_Abort(MPI_COMM_WORLD, 1);
+			//		return;
+			//	}
+			//	//ftruncate(fd1, real_file_size);
+			//	close(fd1);
+			//}
+
+			// Synchronize all processes to ensure the file is created and truncated
+			//MPI_Barrier(MPI_COMM_WORLD);
+
+			// Other ranks open the file after the barrier
+            fd = open(cmd_info1->out_file_name1_.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0666);
+			//fd = open(cmd_info1->out_file_name1_.c_str(), O_CREAT | O_RDWR, 0666);
+			if (fd < 0) {
+				perror("Failed to open file");
+				//free(buffer);
+				MPI_Abort(MPI_COMM_WORLD, 1);
+				return;
+			}
+
+			//if(my_rank == 0) {
+			//    printf("pre real file size %lld\n", real_file_size);
+			//    int fd = open(cmd_info1->out_file_name1_.c_str(), O_CREAT | O_TRUNC | O_RDWR | O_EXCL, 0644);
+			//    ftruncate(fd, sizeof(char) * real_file_size);
+			//    out_stream_ = fdopen(fd, "w");
+            //} else {
+            //    int found = 0;
+            //    do {
+            //        if(-1 == access(cmd_info1->out_file_name1_.c_str(), F_OK)) {
+            //            if(ENOENT == errno) {
+            //                fprintf(stderr, "rank%d waiting file1\n");
+            //                usleep(1000000);
+            //            } else {
+            //                fprintf(stderr, "rank%d waiting file2\n");
+            //                usleep(1000000);
+            //            }
+            //        } else {
+            //            out_stream_ = fopen(cmd_info1->out_file_name1_.c_str(), "r+b");   
+            //            found = 1;
+            //        }
+            //    } while(found == 0);
+            //}
 #endif
             MPI_Barrier(MPI_COMM_WORLD);
         }
@@ -429,14 +478,19 @@ void SeQc::ProducerSeFastqTask64(string file, rabbit::fq::FastqDataPool *fastq_d
             offset = -1;
         }
         is_first = 0;
+#ifdef use_align_64k
+        if(in_is_zip_) fqdatachunk = fqFileReader->readNextChunk();
+        else fqdatachunk = fqFileReader->readNextChunkAlign();
+#else
         fqdatachunk = fqFileReader->readNextChunk();
+#endif
         t_sum1 += GetTime() - tt0;
 
         tt0 = GetTime();
         if ((fqdatachunk == NULL) || (fqdatachunk != NULL && fqdatachunk->size == 1ll << 32)) {
             double tt1 = GetTime();
             if(tmp_chunks.size()) {
-                //fprintf(stderr, "ppp put last %d\n", tmp_chunks.size());
+                fprintf(stderr, "ppp put last %d\n", tmp_chunks.size());
                 while (p_queueNumNow >= p_queueSizeLim) {
                     usleep(100);
                 }
@@ -459,7 +513,48 @@ void SeQc::ProducerSeFastqTask64(string file, rabbit::fq::FastqDataPool *fastq_d
         t_sum2 += GetTime() - tt0;
 
         tt0 = GetTime();
-        tot_size += fqdatachunk->size;
+        tot_size += fqdatachunk->size - fqdatachunk->data.offset_align + 1;
+        //static int cccnt = 0;
+        //if(cccnt < 10 || (cccnt >= 1728 && cccnt < 1728 + 10)) {
+        //    string name = "./gg_dir/gz_data_" + to_string(cccnt) + "_" + to_string(my_rank) + "_" + to_string(fqdatachunk->size);
+        //    int tmp_fd = open(name.c_str(), O_CREAT | O_RDWR, 0666);
+        //    if (tmp_fd < 0) {
+        //        perror("Failed to open file");
+        //        //free(buffer);
+        //        MPI_Abort(MPI_COMM_WORLD, 1);
+        //        return;
+        //    }
+
+
+        //    write(tmp_fd, (char*)fqdatachunk->data.Pointer(), fqdatachunk->size);
+        //    close(tmp_fd);
+        //}
+        //cccnt++;
+
+        //fprintf(stderr, "producer size --- %d %d\n", fqdatachunk->data.offset_align, fqdatachunk->size);
+        //if(fqdatachunk->size - fqdatachunk->data.offset_align > 200) {
+        //    size_t data_size = fqdatachunk->size;
+        //    char * tmp_p = (char*)fqdatachunk->data.PointerAlign();
+        //    if(tmp_p[0] != '@') {
+        //    //if(1){
+        //        fprintf(stderr, "GG not @, %c\n", tmp_p[0]);
+        //        for(int i = 0; i < 200; i++) {
+        //            fprintf(stderr, "%c", tmp_p[i]);
+        //        }	
+        //        fprintf(stderr, "\n\n");
+        //    }
+        //    size_t start_index = (data_size > 200) ? data_size - 200 : 0;
+        //    tmp_p = (char*)fqdatachunk->data.Pointer();
+        //    if(tmp_p[start_index + 99] != '\n') {
+        //    //if(1){
+        //        fprintf(stderr, "GG not enter, %c\n", tmp_p[start_index + 99]);
+        //        for(int i = start_index; i < start_index + 200; i++) {
+        //            fprintf(stderr, "%c", tmp_p[i]);
+        //        }	
+        //        fprintf(stderr, "\n\n");
+        //    }
+        //    //fprintf(stderr, "\n\n");
+		//}
         tmp_chunks.push_back(fqdatachunk); 
         if(tmp_chunks.size() == 64) {
             //fprintf(stderr, "ppp put 64\n");
@@ -473,7 +568,7 @@ void SeQc::ProducerSeFastqTask64(string file, rabbit::fq::FastqDataPool *fastq_d
         }
         t_sum3 += GetTime() - tt0;
     }
-    //printf("totsize %lld\n", tot_size);
+    fprintf(stderr, "producer%d totsize %lld\n", my_rank, tot_size);
 
     fprintf(stderr, "producer%d sum1 cost %lf\n", my_rank, t_sum1);
     fprintf(stderr, "producer%d sum2 cost %lf [%lf %lf %lf]\n", my_rank, t_sum2, t_sum2_1, t_sum2_2, t_sum2_3);
@@ -623,6 +718,11 @@ void SeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data, ve
         if (cmd_info_->write_data_) {
             out_lens[i] = se_pre_out_len_slave[i];
             if(out_lens[i]) out_data[i] = new char[out_lens[i]];
+            //if(out_lens[i]) {
+			//	int cid = getChunkFromMyPool(); 
+			//	out_data[i] = buffers2[cid]; 
+            //    //fprintf(stderr, "get chunk %p\n", buffers2[cid]);
+			//}
             else out_data[i] = (char *)(NULL);
         }
     }
@@ -653,6 +753,7 @@ void SeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data, ve
         if(!out_is_zip_ || use_consumer_libdeflate == 0) {
             int out_len = 0;
             for(int i = 0; i < 64; i++) {
+                out_lens[i] -= out_lens[i] % my_alignment;
                 out_len += out_lens[i];
             }
             if(cmd_info_->splitWrite_ == 0) {
@@ -697,6 +798,7 @@ void SeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data, ve
     }
     for(int i = 0; i < 64; i++) {
         se_pre_out_len_slave[i] = se_all_data.out_len_slave[i];
+        //se_pre_out_len_slave[i] = se_all_data.out_len_slave[i] - se_all_data.out_len_slave[i] % my_alignment;
         se_pre_pass_data_size[i] = se_merge_data.pass_data_size[i];
     }
     tsum4 += GetTime() - tt0;
@@ -835,6 +937,7 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
     vector<neoReference> pass_data[64];
     vector<neoReference> pre_pass_data[64];
     int max_data_size = BLOCK_SIZE / (cmd_info_->seq_len_ * 2);
+    fprintf(stderr, "max_data_size %d\n", max_data_size);
     for(int i = 0; i < 64; i++) {
         data[i].clear();
         pass_data[i].clear();
@@ -855,6 +958,7 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
 
         tt0 = GetTime();
         fqdatachunks = p_out_queue_[p_queueP1++];
+        //fprintf(stderr, "fqdatachunks size %d\n", fqdatachunks.size());
         p_queueNumNow--;
         for(int i = fqdatachunks.size(); i < 64; i++) {
             fqdatachunks.push_back(NULL);
@@ -929,6 +1033,7 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
             }
 
             for(int i = 0; i < 64; i++) {
+                out_size[i] = out_size[i] - out_size[i] % my_alignment;
                 out_gz_block_sizes.push_back(make_pair(out_round * comm_size * 64 + my_rank * 64 + i, out_size[i]));
             }
             out_round++;
@@ -1025,6 +1130,7 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
     fprintf(stderr, "consumer%d NGSnew wait producer cost %lf\n", my_rank, t_wait_producer);
     fprintf(stderr, "consumer%d NGSnew format cost %lf\n", my_rank, t_format);
     fprintf(stderr, "consumer%d NGSnew resize cost %lf\n", my_rank, t_resize);
+    fprintf(stderr, "consumer%d NGSnew decomm cost %lf\n", my_rank, t_decom);
     fprintf(stderr, "consumer%d NGSnew ngsfunc cost %lf\n", my_rank, t_ngsfunc);
     fprintf(stderr, "consumer%d NGSnew      pre_qc1 cost %lf\n", my_rank, tsum1);
     fprintf(stderr, "consumer%d NGSnew      pre_qc2 cost %lf\n", my_rank, tsum2);
@@ -1057,8 +1163,32 @@ void SeQc::WriteSeFastqTask() {
     double t_wait = 0;
     double t_gz_slave = 0;
     double t_write = 0;
+    double t_copy = 0;
+    double t_wwww = 0;
     double t_del = 0;
     double t_free = 0;
+
+    char* tmp_buffer = (char*)aligned_alloc(my_alignment, 1024 * 1024);
+    memset(tmp_buffer, 0, 1024 * 1024);
+
+    //vector<int>sizes;
+
+    //int fd_baba = open(cmd_info_->out_file_name1_.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0666);
+    //if (fd_baba == -1) {
+    //    perror("Failed to open file for writing");
+    //    return;
+    //}
+
+
+    //int fd2 = open("outputfile_write.dat", O_CREAT | O_RDWR | O_DIRECT, 0666);
+    //if (fd2 == -1) {
+    //    perror("Failed to open file for writing");
+    //    return;
+    //}
+
+
+    //double t_wwww2 = 0;
+    //long long wwwsum = 0;
 
     while (true) {
         double tt0 = GetTime();
@@ -1099,8 +1229,36 @@ void SeQc::WriteSeFastqTask() {
 
 
 #else
-                    fseek(out_stream_, now.second.second, SEEK_SET);
-                    fwrite(now.first, sizeof(char), now.second.first, out_stream_);
+                    if (lseek(fd, now.second.second, SEEK_SET) == -1) {
+                        fprintf(stderr, "seek pos %d\n", now.second.second);
+						perror("lseek");
+						close(fd);
+						MPI_Abort(MPI_COMM_WORLD, 1);
+						exit(1);
+					}
+                    double tt000 = GetTime();
+                    //memcpy(tmp_buffer, now.first, now.second.first);
+                    t_copy += GetTime() - tt000;
+                    tt000 = GetTime();
+					ssize_t written = write(fd, tmp_buffer, now.second.first);
+                    t_wwww += GetTime() - tt000;
+
+					if (written == -1) {
+						//fprintf(stderr, "write GG %d %p\n", now.second.first, now.first);
+						fprintf(stderr, "write GG %d %p\n", now.second.first, tmp_buffer);
+						perror("write");
+						close(fd);
+						MPI_Abort(MPI_COMM_WORLD, 1);
+						exit(1);
+					} else if (written != now.second.first) {
+						fprintf(stderr, "Partial write at block gg %d %d\n", written, now.second.first);
+						close(fd);
+						MPI_Abort(MPI_COMM_WORLD, 1);
+						exit(1);
+					}
+
+                    //fseek(out_stream_, now.second.second, SEEK_SET);
+                    //fwrite(now.first, sizeof(char), now.second.first, out_stream_);
 #endif
 
 
@@ -1136,10 +1294,37 @@ void SeQc::WriteSeFastqTask() {
                     MPI_File_write(fh, now.first, now.second.first, MPI_CHAR, &status);
                     //fprintf(stderr, "rank %d write ww done\n", my_rank);
 #else
-                    fseek(out_stream_, now.second.second, SEEK_SET);
-                    //fprintf(stderr, "rank %d write ww %lld\n", my_rank, now.second.first);
-                    fwrite(now.first, sizeof(char), now.second.first, out_stream_);
-                    //fprintf(stderr, "rank %d write ww done\n", my_rank);
+
+					if (lseek(fd, now.second.second, SEEK_SET) == -1) {
+                        fprintf(stderr, "seek pos %d\n", now.second.second);
+						perror("lseek");
+						close(fd);
+						MPI_Abort(MPI_COMM_WORLD, 1);
+						exit(1);
+					}
+                    double tt000 = GetTime();
+                    //memcpy(tmp_buffer, now.first, now.second.first);
+                    t_copy += GetTime() - tt000;
+                    tt000 = GetTime();
+					ssize_t written = write(fd, tmp_buffer, now.second.first);
+                    t_wwww += GetTime() - tt000;
+
+					if (written == -1) {
+						//fprintf(stderr, "write GG %d %p\n", now.second.first, now.first);
+						fprintf(stderr, "write GG %d %p\n", now.second.first, tmp_buffer);
+						perror("write");
+						close(fd);
+						MPI_Abort(MPI_COMM_WORLD, 1);
+						exit(1);
+					} else if (written != now.second.first) {
+						fprintf(stderr, "Partial write at block gg %d %d\n", written, now.second.first);
+						close(fd);
+						MPI_Abort(MPI_COMM_WORLD, 1);
+						exit(1);
+					}
+
+                    //fseek(out_stream_, now.second.second, SEEK_SET);
+                    //fwrite(now.first, sizeof(char), now.second.first, out_stream_);
 #endif
                 }
                 t_write += GetTime() - tt0;
@@ -1168,10 +1353,11 @@ void SeQc::WriteSeFastqTask() {
 #ifdef use_mpi_file
             MPI_File_close(&fh);
 #else
-            fclose(out_stream_);
-            if(my_rank == 0) {
-                truncate(cmd_info_->out_file_name1_.c_str(), sizeof(char) * zip_now_pos_);
-            }
+			close(fd);
+            //fclose(out_stream_);
+            //if(my_rank == 0) {
+            //    truncate(cmd_info_->out_file_name1_.c_str(), sizeof(char) * zip_now_pos_);
+            //}
 #endif
             //off_idx.close();
 
@@ -1187,10 +1373,11 @@ void SeQc::WriteSeFastqTask() {
 #ifdef use_mpi_file
         MPI_File_close(&fh);
 #else
-        fclose(out_stream_);
-        if(my_rank == 0) {
-            truncate(cmd_info_->out_file_name1_.c_str(), sizeof(char) * now_pos_);
-        }
+		close(fd);
+        //fclose(out_stream_);
+        //if(my_rank == 0) {
+        //    truncate(cmd_info_->out_file_name1_.c_str(), sizeof(char) * now_pos_);
+        //}
 #endif
 
     }
@@ -1213,6 +1400,8 @@ void SeQc::WriteSeFastqTask() {
     printf("writer wait queue cost %.4f\n", t_wait);
     printf("writer gz slave cost %.4f\n", t_gz_slave);
     printf("writer write cost %.4f\n", t_write);
+    printf("writer copy cost %.4f\n", t_copy);
+    printf("writer wwww cost %.4f\n", t_wwww);
     printf("writer del cost %.4f\n", t_del);
     printf("writer free cost %.4f\n", t_free);
     //printf("writer %d cost %lf, tot size %lld\n", my_rank, GetTime() - t0, tot_size);
@@ -1315,7 +1504,8 @@ bool checkStates(State* s1, State* s2) {
  */
 
 void SeQc::ProcessSeFastq() {
-
+    
+    
     //TODO
     //if(my_rank == 0) block_size = 6 * (1 << 20);
     //else block_size = 4 * (1 << 20);
@@ -1339,32 +1529,47 @@ void SeQc::ProcessSeFastq() {
 
     double ttt = GetTime();
 
+    //for(int i = 0; i < my_num_buffers; i++) {
+    //    fprintf(stderr, "===bb buffer%d = %p %c %c\n", i, buffers[i], buffers[i][0], buffers[i][1]);
+    //}
+
+ 
+    //for(int i = 0; i < my_num_buffers2; i++) {
+    //    fprintf(stderr, "===cc buffer%d = %p %c %c\n", i, buffers2[i], buffers2[i][0], buffers2[i][1]);
+    //    myPool.insert(i);
+    //    myMap[buffers2[i]] = i;
+    //}
+
     
 
-    //thread *write_thread;
-    //if (cmd_info_->write_data_) {
-    //    write_thread = new thread(bind(&SeQc::WriteSeFastqTask, this));
-    //}
+    
+
+    thread *write_thread;
+    if (cmd_info_->write_data_) {
+        write_thread = new thread(bind(&SeQc::WriteSeFastqTask, this));
+    }
     //tagg
     //thread producer(bind(&SeQc::ProducerSeFastqTask, this, cmd_info_->in_file_name1_, fastqPool, ref(queue1)));
-    thread producer(bind(&SeQc::ProducerSeFastqTask64, this, cmd_info_->in_file_name1_, fastqPool));
+    //thread producer(bind(&SeQc::ProducerSeFastqTask64, this, cmd_info_->in_file_name1_, fastqPool));
     //thread consumer(bind(&SeQc::ConsumerSeFastqTask, this, p_thread_info, fastqPool, ref(queue1)));
     thread consumer(bind(&SeQc::ConsumerSeFastqTask64, this, p_thread_info, fastqPool));
-    if (cmd_info_->write_data_) {
-        WriteSeFastqTask();
-        printf("write%d done\n", my_rank);
-    }
+    ProducerSeFastqTask64(cmd_info_->in_file_name1_, fastqPool);
+    //ConsumerSeFastqTask64(p_thread_info, fastqPool);
+    //if (cmd_info_->write_data_) {
+    //    WriteSeFastqTask();
+    //    printf("write%d done\n", my_rank);
+    //}
 
     consumer.join();
     printf("consumer done\n");
 
-    producer.join();
-    printf("producer done\n");
+    //producer.join();
+    //printf("producer done\n");
 
-    //if (cmd_info_->write_data_) {
-    //    write_thread->join();
-    //    writerDone = 1;
-    //}
+    if (cmd_info_->write_data_) {
+        write_thread->join();
+        writerDone = 1;
+    }
     printf("all pro write done1\n");
 
     MPI_Barrier(MPI_COMM_WORLD);

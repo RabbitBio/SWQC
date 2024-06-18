@@ -21,6 +21,7 @@ public:
     bool isStdin_;
     bool isStdout_;
 
+    bool splitWrite_;
     bool overWrite_;
     bool write_data_;
     int64_t out_block_size_;

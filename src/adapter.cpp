@@ -1,4 +1,5 @@
 #include "adapter.h"
+#include "globalMutex.h"
 
 #define mod 9999991
 
@@ -144,7 +145,7 @@ void Adapter::PreOverAnalyze(string file_name, vector<string> &hot_seqs, int &ev
 #ifdef Verbose
     double t0 = GetTime();
 #endif
-    auto *fastq_data_pool = new rabbit::fq::FastqDataPool(4, 1 << 22);
+    auto *fastq_data_pool = new rabbit::fq::FastqDataPool(16, 1 << 22);
     auto fqFileReader = new rabbit::fq::FastqFileReader(file_name, *fastq_data_pool, "",
             file_name.find(".gz") != string::npos);
     bool isZipped = file_name.find(".gz") != string::npos;
@@ -168,7 +169,11 @@ void Adapter::PreOverAnalyze(string file_name, vector<string> &hot_seqs, int &ev
 
     while (bases < BASE_LIMIT) {
         rabbit::fq::FastqDataChunk *fqdatachunk;
+#ifdef use_align_64k
+        fqdatachunk = fqFileReader->readNextChunkAlign();
+#else
         fqdatachunk = fqFileReader->readNextChunk();
+#endif
         if ((fqdatachunk == NULL) || (fqdatachunk != NULL && fqdatachunk->size == 1ll << 32)) break;
         if(isZipped) {
 #ifdef USE_CC_GZ
@@ -189,6 +194,8 @@ void Adapter::PreOverAnalyze(string file_name, vector<string> &hot_seqs, int &ev
             else fqdatachunk->size = out_size;
 #endif
         }
+
+
         n_chunks++;
         vector<neoReference> data;
         rabbit::fq::chunkFormat(fqdatachunk, data, true);
@@ -303,7 +310,6 @@ void Adapter::PreOverAnalyze(string file_name, vector<string> &hot_seqs, int &ev
     bool use_slave = 1;
     if(use_slave) {
         vector<int> hot_seqs_id[64];
-        printf("1111\n");
         int size_outs[64] = {0};
         preOverData para;
         para.hot_s = &hot_s;
@@ -314,11 +320,6 @@ void Adapter::PreOverAnalyze(string file_name, vector<string> &hot_seqs, int &ev
         para.sizes = size_outs;
         __real_athread_spawn((void *)slave_preOverfunc, &para, 1);
         athread_join();
-        printf("2222\n");
-        for(int i = 0; i < 64; i++) {
-            printf("%d ", size_outs[i]);
-        }
-        printf("\n");
         for(int i = 0; i < 64; i++) {
             for(int j = 0; j < size_outs[i]; j++) {
                 hot_seqs.push_back(hot_s[hot_seqs_id[i][j]].first); 
@@ -386,7 +387,7 @@ vector<string> Adapter::LoadAdaptersFromFasta(string file_name) {
 }
 
 int Adapter::EvalMaxLen(string file_name) {
-    auto *fastq_data_pool = new rabbit::fq::FastqDataPool(4, 1 << 22);
+    auto *fastq_data_pool = new rabbit::fq::FastqDataPool(16, 1 << 22);
     auto fqFileReader = new rabbit::fq::FastqFileReader(file_name, *fastq_data_pool, "",
             file_name.find(".gz") != string::npos);
     bool isZipped = file_name.find(".gz") != string::npos;
@@ -401,7 +402,11 @@ int Adapter::EvalMaxLen(string file_name) {
 
     while (records < READ_LIMIT && bases < BASE_LIMIT) {
         rabbit::fq::FastqDataChunk *fqdatachunk;
+//#ifdef use_align_64k
+//        fqdatachunk = fqFileReader->readNextChunkAlign();
+//#else
         fqdatachunk = fqFileReader->readNextChunk();
+//#endif
         if ((fqdatachunk == NULL) || (fqdatachunk != NULL && fqdatachunk->size == 1ll << 32)) break;
         if(isZipped) {
 #ifdef USE_CC_GZ
@@ -417,16 +422,39 @@ int Adapter::EvalMaxLen(string file_name) {
             }
             libdeflate_free_decompressor(decompressor);
             delete[] in_buffer;
-            fprintf(stderr, "pre orp in_size %d, out_size %d\n", in_size, out_size);
             if(out_size) fqdatachunk->size = out_size - 1;
             else fqdatachunk->size = out_size;
 #endif
         }
+        fprintf(stderr, "size = %d, offset = %d\n", fqdatachunk->size, fqdatachunk->data.offset_align);
+        if(fqdatachunk->size - fqdatachunk->data.offset_align > 200) {
+            size_t data_size = fqdatachunk->size;
+            char * tmp_p = (char*)fqdatachunk->data.PointerAlign();
+            //if(tmp_p[0] != '@') {
+            if(1){
+                //fprintf(stderr, "GG not @, %c\n", tmp_p[0]);
+                for(int i = 0; i < 200; i++) {
+                    fprintf(stderr, "%c", tmp_p[i]);
+                }	
+                fprintf(stderr, "\n\n");
+            }
+            size_t start_index = (data_size > 200) ? data_size - 200 : 0;
+            tmp_p = (char*)fqdatachunk->data.Pointer();
+            //if(tmp_p[start_index + 99] != '\n') {
+            if(1){
+                //fprintf(stderr, "GG not enter, %c\n", tmp_p[start_index + 99]);
+                for(int i = start_index; i < start_index + 200; i++) {
+                    fprintf(stderr, "%c", tmp_p[i]);
+                }	
+                fprintf(stderr, "\n\n");
+            }
+            //fprintf(stderr, "\n\n");
+		}
         n_chunks++;
         vector<neoReference> data;
         rabbit::fq::chunkFormat(fqdatachunk, data, true);
         chunks.push_back(fqdatachunk);
-//        fprintf(stderr, "eval mx len %d\n", data.size());
+        fprintf(stderr, "eval mx len %d\n", data.size());
         for (auto item: data) {
             bases += item.lseq;
             mx_len = max(mx_len, (int) item.lseq);
@@ -459,7 +487,12 @@ string Adapter::AutoDetect(string file_name, int trim_tail) {
 
     while (records < READ_LIMIT && bases < BASE_LIMIT) {
         rabbit::fq::FastqDataChunk *fqdatachunk;
+
+#ifdef use_align_64k
+        fqdatachunk = fqFileReader->readNextChunkAlign();
+#else
         fqdatachunk = fqFileReader->readNextChunk();
+#endif
         if (fqdatachunk == NULL) break;
         n_chunks++;
         vector<neoReference> data;

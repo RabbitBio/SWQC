@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <iostream>
 #include <vector>
+#include <cstdio>
 
 #ifdef USE_BOOST_THREAD
 #include <boost/thread.hpp>
@@ -90,6 +91,7 @@ namespace rabbit {
                 DataType *&pp = availablePartsPool.back();
                 availablePartsPool.pop_back();
                 if (pp == NULL) {
+                    //printf("new size %d\n", bufferPartSize);
                     pp = new DataType(bufferPartSize);
                     allocatedPartsPool.push_back(pp);
                 } else {

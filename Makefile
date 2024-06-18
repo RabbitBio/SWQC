@@ -40,7 +40,7 @@ CXX = mpicxx
 
 
 CXXFLAGS := $(InstructSet)
-CXXFLAGS += -DVerbose -std=c++11 -I./ -I./common -g -O3 -w
+CXXFLAGS += -DVerbose -D_GNU_SOURCE -std=c++11 -I./ -I./common -g -O3 -w
 
 
 CXX2 = mpicc

@@ -9,7 +9,6 @@
 #include "mpi.h"
 
 #include "globalMutex.h"
-
 std::mutex globalMutex;
 
 using namespace std;
@@ -20,6 +19,17 @@ inline bool exists_file(const std::string &name) {
 }
 
 int main(int argc, char **argv) {
+
+
+
+    for(int i = 0; i < my_num_buffers; i++) {
+        memset(buffers[i], 0, my_buffer_size);
+    }
+
+    //for(int i = 0; i < my_num_buffers2; i++) {
+    //    memset(buffers2[i], 0, my_buffer_size);
+    //}
+
 
     volatile int aa = 0;
     bool runLoop = false;
@@ -405,7 +415,7 @@ int main(int argc, char **argv) {
                 }
             }
             if (tmps == "y") {
-                remove(cmd_info.out_file_name1_.c_str());
+                //remove(cmd_info.out_file_name1_.c_str());
             } else if (tmps == "n") {
                 return 0;
             } else {
@@ -433,7 +443,7 @@ int main(int argc, char **argv) {
                 }
             }
             if (tmps == "y") {
-                remove(cmd_info.out_file_name2_.c_str());
+                //remove(cmd_info.out_file_name2_.c_str());
             } else if (tmps == "n") {
                 return 0;
             } else {
@@ -569,13 +579,13 @@ int main(int argc, char **argv) {
     //    printf("now use %d thread to do QC operations\n", cmd_info.thread_number_);
     //else
     //    printf("now use %d threads to do QC operations\n", cmd_info.thread_number_);
-    int mx_len = Adapter::EvalMaxLen(cmd_info.in_file_name1_);
-    //int mx_len = 100;
-    //if (cmd_info.in_file_name1_.find("SRR24") != std::string::npos) {
-    //    mx_len = 100;
-    //} else if (cmd_info.in_file_name1_.find("SRR16") != std::string::npos) {
-    //    mx_len = 150;
-    //}
+    //int mx_len = Adapter::EvalMaxLen(cmd_info.in_file_name1_);
+    int mx_len = 100;
+    if (cmd_info.in_file_name1_.find("SRR24") != std::string::npos) {
+        mx_len = 100;
+    } else if (cmd_info.in_file_name1_.find("SRR16") != std::string::npos) {
+        mx_len = 150;
+    }
     printf("mx_len %d\n", mx_len);
     cmd_info.seq_len_ = mx_len;
     if (cmd_info.adapter_fasta_file_.length() > 0) {

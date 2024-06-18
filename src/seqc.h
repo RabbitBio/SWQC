@@ -55,6 +55,8 @@ private:
 
     void ProducerSeFastqTask64(std::string file, rabbit::fq::FastqDataPool *fastq_data_pool);
 
+    void ProducerAndWriter(std::string file, rabbit::fq::FastqDataPool *fastq_data_pool);
+
     void ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDataPool *fastq_data_pool);
 
     void ProducerSeFastqTask(std::string file, rabbit::fq::FastqDataPool *fastq_data_pool,
@@ -81,6 +83,7 @@ private:
     std::vector<rabbit::fq::FastqDataChunk *> *p_out_queue_;
     std::atomic_int done_thread_number_;
     FILE *out_stream_;
+    int fd;
     MPI_File fh;
     MPI_Status status;
     Duplicate *duplicate_;

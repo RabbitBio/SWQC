@@ -838,23 +838,24 @@ extern "C" void formatfunc(format_data paras[64]) {
     //if(paras[_PEN].my_rank) fprintf(stderr, "rank%d - %d\n", paras[_PEN].my_rank, _PEN);
     format_data *para = &(paras[_PEN]);
 
-    //athread_lock(&lock_s);
     //fprintf(stderr, "rank%d - %d : fqSize %d\n", para->my_rank, _PEN, para->fqSize);
-    //athread_unlock(&lock_s);
     //athread_ssync_array();
 
     if(_PEN >= para->fqSize) return;
     //if(_PEN >= 1) return;
     rabbit::fq::FastqDataChunk *chunk = para->fqdatachunk;
-    //fprintf(stderr, "rank%d chunk addr %p\n", para->my_rank, chunk);
     if(para->fqdatachunk == NULL) {
         para->res[_PEN] = 0; 
         return;
     }
     uint64_t seq_count = 0;
-    uint64_t pos_ = 0;
+    uint64_t pos_ = chunk->data.offset_align;
+    //uint64_t pos_ = 0;
+
+   
     neoReference ref;
     while (true) {
+        //ref.base = chunk->data.PointerAlign();
         ref.base = chunk->data.Pointer();
         ref.pname = pos_;
         if (neoGetLine(chunk, pos_, ref.lname)) {
@@ -868,9 +869,11 @@ extern "C" void formatfunc(format_data paras[64]) {
         ref.pqual = pos_;
         neoGetLine(chunk, pos_, ref.lqual);
         //TODO resize
-        if(seq_count >= para->data->size()) fprintf(stderr, "GG formart, over size: %d %d\n", seq_count, para->data->size());
+        if(seq_count >= para->data->size()) fprintf(stderr, "GG format, over size: %d %d\n", seq_count, para->data->size());
         (*para->data)[seq_count] = ref;
+        //athread_lock(&lock_s);
         //PrintRef(ref);
+        //athread_unlock(&lock_s);
         
         seq_count++;
     }
@@ -904,7 +907,8 @@ extern "C" void formatpefunc(formatpe_data paras[64]) {
     rabbit::fq::FastqDataChunk *chunk2 = para->fqdatachunk->right_part;
     //fprintf(stderr, "rank%d chunk addr %p\n", para->my_rank, chunk);
     uint64_t seq_count1 = 0;
-    uint64_t pos1_ = 0;
+    //uint64_t pos1_ = 0;
+    uint64_t pos1_ = chunk1->data.offset_align;
     neoReference ref1;
 
     while (true) {
@@ -921,13 +925,14 @@ extern "C" void formatpefunc(formatpe_data paras[64]) {
         ref1.pqual = pos1_;
         neoGetLine(chunk1, pos1_, ref1.lqual);
         //TODO resize
-        if(seq_count1 >= para->data1->size()) fprintf(stderr, "GG formart, over size: %d %d\n", seq_count1, para->data1->size());
+        if(seq_count1 >= para->data1->size()) fprintf(stderr, "GG format, over size: %d %d\n", seq_count1, para->data1->size());
         (*para->data1)[seq_count1] = ref1;
         seq_count1++;
     }
 
     uint64_t seq_count2 = 0;
-    uint64_t pos2_ = 0;
+    //uint64_t pos2_ = 0;
+    uint64_t pos2_ = chunk2->data.offset_align;
     neoReference ref2;
 
     while (true) {
@@ -944,7 +949,7 @@ extern "C" void formatpefunc(formatpe_data paras[64]) {
         ref2.pqual = pos2_;
         neoGetLine(chunk2, pos2_, ref2.lqual);
         //TODO resize
-        if(seq_count2 >= para->data2->size()) fprintf(stderr, "GG formart, over size: %d %d\n", seq_count2, para->data2->size());
+        if(seq_count2 >= para->data2->size()) fprintf(stderr, "GG format, over size: %d %d\n", seq_count2, para->data2->size());
         (*para->data2)[seq_count2] = ref2;
         seq_count2++;
     }
@@ -1251,6 +1256,8 @@ extern "C" void ngsfunc(qc_data *para){
     int aft_gc_bases_ = 0;
     int aft_real_seq_len_ = 0;
     int aft_lines_ = 0;
+
+
 
     int out_len_salve = 0;
 //    for(int id = _PEN * BATCH_SIZE; id < data_num; id += 64 * BATCH_SIZE) {

@@ -13,20 +13,15 @@ zekun.yin@mail.sdu.edu.cn
 #define BUFFER_H
 
 #include <algorithm>
-#include <cstddef>
 #include "Globals.h"
 #include "utils.h"
 #include "globalMutex.h"
-
-//#define use_baba_align_method
-
-
 
 namespace rabbit {
 
     namespace core {
 
-#define USE_64BIT_MEMORY 0
+#define USE_64BIT_MEMORY 1
 
         /**
          * @brief: buffer to store chunk data
@@ -34,55 +29,57 @@ namespace rabbit {
         class Buffer {
             public:
                 Buffer(uint64 size_) {
-                    //static int cnt = 0;
-                    //if(cnt == 0) {
-                    //    for(int i = 0; i < my_num_buffers; i++) {
-                    //        fprintf(stderr, "===bb buffer%d = %p %c %c\n", i, buffers[i], buffers[i][0], buffers[i][1]);
-                    //    }
-                    //}
-                    //cnt++;
                     ASSERT(size_ != 0);
                     offset_align = 0;
-#ifdef use_baba_align_method
-                    //fprintf(stderr, "this size %d, tot id %d\n", size_, tot_id);
-                    if(size_ != my_buffer_size) {
-                        fprintf(stderr, "GG size != BLOCK_SIZE in Buffer.h : %d %d\n", size_, my_buffer_size);
+#ifdef use_align_64k
+
+                    if(size_ % MY_PAGE_SIZE) {
+                        fprintf(stderr, "GGGG size_ in buffer %d\n", size_);
+                        size_ = size_ / MY_PAGE_SIZE * MY_PAGE_SIZE + MY_PAGE_SIZE;
+                    }
+
+#if (USE_64BIT_MEMORY)
+                    uint64 size64 = size_ / 8;
+                    if (size64 * 8 < size_) size64 += 1;
+
+                    if (posix_memalign(reinterpret_cast<void**>(&buffer), MY_PAGE_SIZE, size64 * sizeof(uint64)) != 0) {
+                        perror("Failed to allocate aligned memory");
+                    }
+
+                    //buffer = (uint64*)aligned_alloc(MY_PAGE_SIZE, size64 * sizeof(uint64));
+                    //if (!buffer) {
+                    //    perror("Failed1 to allocate aligned buffer");
+                    //    exit(1);
+                    //}
+                    fprintf(stderr, "buffer %p\n", buffer); 
+#else
+                    buffer = (byte*)aligned_alloc(MY_PAGE_SIZE, size_ * sizeof(byte));
+                    if (!buffer) {
+                        perror("Failed2 to allocate aligned buffer");
+                        exit(1);
                     }
 #endif
+
+
+#else 
 
 #if (USE_64BIT_MEMORY)
                     uint64 size64 = size_ / 8;
                     if (size64 * 8 < size_) size64 += 1;
                     buffer = new uint64[size64];
 #else
-
-# ifdef use_baba_align_method
-                    if(size_ > my_buffer_size) {
-                        buffer = new byte[size_];
-                    } else {
-                        buffer = (byte*)buffers[tot_id++];
-                    }
-                    if(tot_id > my_num_buffers) {
-                        fprintf(stderr, "GG tot_id > %d\n", my_num_buffers);
-                    }
-                    //fprintf(stderr, "get buffer %p\n", buffer);
-# else
                     buffer = new byte[size_];
-# endif
-
 #endif
 
-
+#endif
                     size = size_;
                 }
 
-                ~Buffer() { 
-#ifdef use_baba_align_method
-
+#ifdef use_align_64k
+                ~Buffer() { free(buffer); }
 #else
-                    delete buffer; 
+                ~Buffer() { delete buffer; }
 #endif
-                }
 
 
                 uint64 Size() const { return size; }
@@ -102,6 +99,50 @@ namespace rabbit {
                 void Extend(uint64 size_, bool copy_ = false) {
                     fprintf(stderr, "GGGGGGGGGGGG\n");
                     exit(0);
+
+#ifdef use_align_64k
+
+
+#if (USE_64BIT_MEMORY)
+                    uint64 size64 = size / 8;
+                    if (size64 * 8 < size) size64 += 1;
+
+                    uint64 newSize64 = size_ / 8;
+                    if (newSize64 * 8 < size_) newSize64 += 1;
+
+                    if (size > size_) return;
+
+                    if (size64 == newSize64) {
+                        size = size_;
+                        return;
+                    }
+
+                    uint64 *p;
+                    p = (uint64*)aligned_alloc(MY_PAGE_SIZE, newSize64 * sizeof(uint64_t));
+                    if (!p) {
+                        perror("Failed3 to allocate aligned buffer");
+                        exit(1);
+                    }
+
+                    if (copy_) std::copy(buffer, buffer + size64, p);
+#else
+                    if (size > size_) return;
+
+                    byte *p;
+                    p = (byte*)aligned_alloc(MY_PAGE_SIZE, size_ * sizeof(byte));
+                    if (!p) {
+                        perror("Failed4 to allocate aligned buffer");
+                        exit(1);
+                    }
+
+                    if (copy_) std::copy(buffer, buffer + size, p);
+#endif
+                    free(buffer);
+
+
+#else
+
+
 
 #if (USE_64BIT_MEMORY)
                     uint64 size64 = size / 8;
@@ -130,6 +171,7 @@ namespace rabbit {
 #endif
                     delete[] buffer;
 
+#endif
 
                     buffer = p;
                     size = size_;
@@ -150,7 +192,6 @@ namespace rabbit {
 #else
                 byte *buffer;
 #endif
-
                 uint64 size;
             public:
                 uint64 offset_align;

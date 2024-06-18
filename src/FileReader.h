@@ -2,11 +2,14 @@
 #include "FastxChunk.h"
 #include "Reference.h"
 #include "utils.h"
+#include <fcntl.h>
+#include <unistd.h>
 #include <cstring>
 #include <iostream>
 #include <string>
 #include <cstdio>
 #include <vector>
+#include <mpi.h>
 
 #include <zlib.h>//support gziped files, functional but inefficient
 
@@ -54,67 +57,82 @@
 
 namespace rabbit {
 
-    class FileReader {
+	class FileReader {
 
 
-    public:
-        FileReader(const std::string &fileName_, bool isZipped, int64 startPos = 0, int64 endPos = 0, bool inMem = 0);
+		public:
+			FileReader(const std::string &fileName_, bool isZipped, int64 startPos = 0, int64 endPos = 0, bool inMem = 0);
 
 
-        FileReader(int fd, bool isZipped = false);
+			FileReader(int fd, bool isZipped = false);
 
 
-        void DecompressMore();
+			void DecompressMore();
 
 
-        int64 Read(byte *memory_, uint64 size_);
+			int64 Read(byte *memory_, uint64 size_);
+
+			int64 ReadAlign(byte *memory_, int64_t offset_, uint64 size_);
 
 
-        int64 ReadSeek(byte *memory_, uint64 size_, uint64 pos_);
+			int64 ReadSeek(byte *memory_, uint64 size_, uint64 pos_);
 
 
-        bool FinishRead();
+			bool FinishRead();
 
-        bool Eof();
+			bool Eof();
 
-        void setEof();
+			void setEof();
 
-        ~FileReader();
+			~FileReader();
 
-    private:
-        static const uint32 IGZIP_IN_BUF_SIZE = 1 << 22;// 4M gziped file onece fetch
-        static const uint32 GZIP_HEADER_BYTES_REQ = 1 << 16;
-        byte* MemData = nullptr;
-        int64 MemDataTotSize = 0;
-        int64 MemDataNowPos = 0;
-        bool MemDataReadFinish = false;
-        bool read_in_mem = 0;
+		private:
+			static const uint32 IGZIP_IN_BUF_SIZE = 1 << 22;// 4M gziped file onece fetch
+			static const uint32 GZIP_HEADER_BYTES_REQ = 1 << 16;
+			byte* MemData = nullptr;
+			int64 MemDataTotSize = 0;
+			int64 MemDataNowPos = 0;
+			bool MemDataReadFinish = false;
+			bool read_in_mem = 0;
 
-        char* in_buffer[64];
-        char* out_buffer[64];
-        char* to_read_buffer;
-        std::vector<int> block_sizes;
-        size_t buffer_tot_size;
-        size_t buffer_now_pos;
-        FILE *input_file;
-        int now_block;
+			char* in_buffer[64];
+			char* out_buffer[64];
+			char* to_read_buffer;
+			std::vector<int> block_sizes;
+			size_t buffer_tot_size;
+			size_t buffer_now_pos;
+			FILE *input_file;
+			int now_block;
 
 
-        FILE *mFile = NULL;
-        gzFile mZipFile = NULL;
-        //igzip usage
-        unsigned char *mIgInbuf = NULL;
-        bool isZipped = false;
-        bool eof = false;
-        std::ifstream iff_idx;
-        bool iff_idx_end;
-        int start_line;
-        int end_line;
-        int64 start_pos;
-        int64 end_pos;
-        int64 total_read;
-        int64 has_read;
-        int read_times;
-    };
+			FILE *mFile = NULL;
+			int fd = -1;
+			char *buffer_test;
+			char *buffer_test_last;
+            int buffer_last_size;
+            long buffer_now_offset;
+			long page_size;
+            double t_memcpy;
+            double t_read;
+            int read_cnt;
+            int my_rank;
+
+			gzFile mZipFile = NULL;
+			//igzip usage
+			unsigned char *mIgInbuf = NULL;
+			bool isZipped = false;
+			bool eof = false;
+			std::ifstream iff_idx;
+			bool iff_idx_end;
+			int start_line;
+			int end_line;
+			int64 start_pos;
+			int64 end_pos;
+			int64 total_read;
+			int64 has_read;
+			int64 offset_read;
+            bool align_end;
+			int read_times;
+	};
 
 }//namespace rabbit
