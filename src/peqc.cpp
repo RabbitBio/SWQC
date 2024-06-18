@@ -158,6 +158,7 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
             real_file_size -= (blocknum + 1) * sizeof(size_t);
             block_sizes.reserve(blocknum);
             iff_idx.seekg(-static_cast<int>((blocknum + 1) * sizeof(size_t)), ios::end);
+            fprintf(stderr, "rank%d blocknum %d\n", my_rank, blocknum);
 
             size_t block_size = 0;
             for (size_t i = 0; i < blocknum; ++i) {
@@ -206,7 +207,6 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
         fseek(pre_fp, start_pos, SEEK_SET);
         char *tmp_chunk = new char[1 << 20];
         int res_size = fread(tmp_chunk, sizeof(char), 1 << 20, pre_fp);
-        MPI_Barrier(MPI_COMM_WORLD);
         if(my_rank == 0) right_pos = 0;
         else right_pos = GetNextFastq(tmp_chunk, 0, res_size);
         fclose(pre_fp);
@@ -247,6 +247,7 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
     p_queueP2 = 0;
     p_queueNumNow = 0;
     p_queueSizeLim = Q_lim_pe;
+
 
  
     if (cmd_info1->write_data_) {
@@ -2003,14 +2004,17 @@ bool checkStates(State* s1, State* s2) {
 
 
 void PeQc::ProcessPeFastq() {
+    printf("init pe processer\n");
     //if(my_rank == 0) block_size = 6 * (1 << 20);
     //else block_size = 4 * (1 << 20);
     auto *fastqPool = new rabbit::fq::FastqDataPool(Q_lim_pe * 64 * 3, BLOCK_SIZE);
+    printf("pool done\n");
     //rabbit::core::TDataQueue<rabbit::fq::FastqDataPairChunk> queue1(Q_lim_pe, 1);
     auto **p_thread_info = new ThreadInfo *[slave_num];
     for (int t = 0; t < slave_num; t++) {
         p_thread_info[t] = new ThreadInfo(cmd_info_, true);
     }
+    printf("thread done\n");
     rabbit::uint32 tmpSize = SWAP1_SIZE;
     if (cmd_info_->seq_len_ <= 200) tmpSize = SWAP2_SIZE;
     

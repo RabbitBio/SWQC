@@ -290,6 +290,13 @@ namespace rabbit {
     }
 
     int64 FileReader::ReadAlign(byte *memory_, int64_t offset_, uint64 size_) {
+
+        static long long pre_offset = 0;
+        if(offset_ - pre_offset > (1ll << 30)) {
+            fprintf(stderr, "rank%d read %lld / %lld\n", my_rank, offset_, end_pos);
+            pre_offset = offset_;
+        }
+
         read_cnt++;
         offset_read = offset_;
         off_t offset = offset_;
@@ -377,6 +384,14 @@ namespace rabbit {
                 //fprintf(stderr, "use consumer slave gz in in_mem module is TODO!\n");
                 //exit(0);
             } else {
+
+                static long long pre_offset = 0;
+                if(buffer_now_offset - pre_offset > (1ll << 30)) {
+                    fprintf(stderr, "rank%d read %lld / %lld\n", my_rank, buffer_now_offset, end_pos);
+                    pre_offset = buffer_now_offset;
+                }
+
+
                 int nouse_chunk_size;
                 if(read_cnt == 0) {
                     nouse_chunk_size = buffer_now_offset % MY_PAGE_SIZE;
@@ -479,9 +494,18 @@ namespace rabbit {
                     return size_;
                 }
             } else {
+
+                static long long pre_offset = 0;
+                if(has_read - pre_offset > (1ll << 30)) {
+                    fprintf(stderr, "rank%d read %lld / %lld %lld\n", my_rank, has_read, end_pos, total_read);
+                    pre_offset = has_read;
+                }
+
+
                 if(has_read + size_ > total_read) size_ = total_read - has_read;
                 if(size_ % MY_PAGE_SIZE) {
-                    size_ = ((size_ / MY_PAGE_SIZE) + 1) * MY_PAGE_SIZE; 
+                    if(size_ < MY_PAGE_SIZE) size_ = ((size_ / MY_PAGE_SIZE) + 1) * MY_PAGE_SIZE; 
+                    else size_ = size_ - size_ % MY_PAGE_SIZE;
                     //fprintf(stderr, "read gg byte, -- %d\n", size_);
                 }
 
@@ -491,8 +515,7 @@ namespace rabbit {
                 int n = read(fd, buffer_test, size_);
                 t_read += GetTime() - t0;
 
-                //int n = read(fd, memory_, size_);
-                fprintf(stderr, "read2 %d byte, -- %d\n", n, size_);
+                //fprintf(stderr, "read2 %d byte, -- %d\n", n, size_);
                 if (n != (ssize_t)size_) {
                     if (n == 0) {
                         fprintf(stderr, "Reached end of file unexpectedly. Only %zd bytes were read.\n", n);

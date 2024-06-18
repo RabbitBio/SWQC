@@ -583,7 +583,9 @@ int main(int argc, char **argv) {
     int mx_len = 100;
     if (cmd_info.in_file_name1_.find("SRR24") != std::string::npos) {
         mx_len = 100;
-    } else if (cmd_info.in_file_name1_.find("SRR16") != std::string::npos) {
+    } else 
+//if (cmd_info.in_file_name1_.find("SRR16") != std::string::npos) 
+    {
         mx_len = 150;
     }
     printf("mx_len %d\n", mx_len);

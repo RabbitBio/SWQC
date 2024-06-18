@@ -92,6 +92,7 @@ SeQc::SeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
     done_thread_number_ = 0;
     int out_block_nums = int(1.0 * cmd_info1->in_file_size1_ / cmd_info1->out_block_size_);
     out_queue_ = NULL;
+    align_out_queue_ = NULL;
     p_out_queue_ = NULL;
     in_is_zip_ = cmd_info1->in_file_name1_.find(".gz") != string::npos;
     out_is_zip_ = cmd_info1->out_file_name1_.find(".gz") != string::npos;
@@ -139,6 +140,7 @@ SeQc::SeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
             real_file_size -= (blocknum + 1) * sizeof(size_t);
             block_sizes.reserve(blocknum);
             iff_idx.seekg(-static_cast<int>((blocknum + 1) * sizeof(size_t)), ios::end);
+            fprintf(stderr, "rank%d blocknum %d\n", my_rank, blocknum);
 
             size_t block_size = 0;
             for (size_t i = 0; i < blocknum; ++i) {
@@ -232,9 +234,13 @@ SeQc::SeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
     p_queueNumNow = 0;
     p_queueSizeLim = Q_lim_se;
 
+
+    use_align_write = 1;
+
      
     if (cmd_info1->write_data_) {
-        out_queue_ = new CIPair[1 << 20];
+        if(use_align_write) align_out_queue_ = new pair<CIPair, CIPair>[1 << 20];
+        else out_queue_ = new CIPair[1 << 20];
         queueP1 = 0;
         queueP2 = 0;
         queueNumNow = 0;
@@ -420,7 +426,8 @@ SeQc::~SeQc() {
     delete filter_;
     delete[] p_out_queue_;
     if (cmd_info_->write_data_) {
-        delete[] out_queue_;
+        if(use_align_write) delete[] align_out_queue_;
+        else delete[] out_queue_;
     }
     if(in_is_zip_) {
 #ifdef USE_CC_GZ
@@ -753,7 +760,7 @@ void SeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data, ve
         if(!out_is_zip_ || use_consumer_libdeflate == 0) {
             int out_len = 0;
             for(int i = 0; i < 64; i++) {
-                out_lens[i] -= out_lens[i] % my_alignment;
+                if(!use_align_write) out_lens[i] -= out_lens[i] % my_alignment;
                 out_len += out_lens[i];
             }
             if(cmd_info_->splitWrite_ == 0) {
@@ -930,6 +937,15 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
 
     double t0 = GetTime();
 
+    char* last_round_align_buffer = new char[BLOCK_SIZE];
+    int last_round_align_size = 0;
+
+    char* this_round_align_buffer = new char[BLOCK_SIZE];
+    int this_round_align_size = 0;
+
+    char* this_round_align_buffer_tmp = new char[BLOCK_SIZE];
+    int this_round_align_size_tmp = 0;
+
     vector<rabbit::fq::FastqDataChunk *> fqdatachunks;
     vector<rabbit::fq::FastqDataChunk *> pre_fqdatachunks;
     int out_round = 0;
@@ -949,6 +965,7 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
             pre_pass_data[i].resize(max_data_size);
         }
     }
+    bool zero_done = false;
     while(true) {
         double tt0 = GetTime();
         while (p_queueNumNow == 0) {
@@ -958,7 +975,7 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
 
         tt0 = GetTime();
         fqdatachunks = p_out_queue_[p_queueP1++];
-        //fprintf(stderr, "fqdatachunks size %d\n", fqdatachunks.size());
+//        fprintf(stderr, "fqdatachunks size %d\n", fqdatachunks.size());
         p_queueNumNow--;
         for(int i = fqdatachunks.size(); i < 64; i++) {
             fqdatachunks.push_back(NULL);
@@ -1033,7 +1050,7 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
             }
 
             for(int i = 0; i < 64; i++) {
-                out_size[i] = out_size[i] - out_size[i] % my_alignment;
+                if(!use_align_write) out_size[i] = out_size[i] - out_size[i] % my_alignment;
                 out_gz_block_sizes.push_back(make_pair(out_round * comm_size * 64 + my_rank * 64 + i, out_size[i]));
             }
             out_round++;
@@ -1089,18 +1106,121 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
         if (cmd_info_->write_data_) {
             tt0 = GetTime();
             assert(writeInfos.size() == 64);
-            long long real_pre_chunk_pos = writeInfos[0].file_offset;
-            for(int i = 0; i < 64; i++) {
-                while (queueNumNow >= queueSizeLim) {
-#ifdef Verbose
-                    //printf("waiting to push a chunk to out queue %d\n",out_len);
-#endif
-                    usleep(1000);
+            if(use_align_write) {
+                long long real_pre_chunk_pos;
+
+                if(cmd_info_->splitWrite_) {
+
+                    memcpy(this_round_align_buffer, last_round_align_buffer, last_round_align_size);
+                    this_round_align_size = last_round_align_size;
+
+                } else {
+                    real_pre_chunk_pos = writeInfos[0].file_offset;
+                    for(int i = 0; i < 64; i++) real_pre_chunk_pos += writeInfos[i].buffer_len;
+                    int tmp_size = writeInfos[63].buffer_len - real_pre_chunk_pos % my_alignment;
+                    if(tmp_size < 0) {
+                        this_round_align_size = 0;
+                    } else {
+                        memcpy(this_round_align_buffer, writeInfos[63].buffer + tmp_size, real_pre_chunk_pos % my_alignment);
+                        this_round_align_size = real_pre_chunk_pos % my_alignment;
+                    }
+                    int next_rank = (my_rank + 1) % comm_size;
+                    int prev_rank = (my_rank - 1 + comm_size) % comm_size;
+//                  fprintf(stderr, "rank%d init has %d\n", my_rank, this_round_align_size);
+
+                    MPI_Status status;
+
+                    if (my_rank == comm_size - 1) {
+                        MPI_Sendrecv(last_round_align_buffer, last_round_align_size, MPI_CHAR, next_rank, 0,
+                                     this_round_align_buffer_tmp, BLOCK_SIZE, MPI_CHAR, prev_rank, 0,
+                                     MPI_COMM_WORLD, &status);
+                    } else {
+                        MPI_Sendrecv(this_round_align_buffer, this_round_align_size, MPI_CHAR, next_rank, 0,
+                                     this_round_align_buffer_tmp, BLOCK_SIZE, MPI_CHAR, prev_rank, 0,
+                                     MPI_COMM_WORLD, &status);
+                    }
+
+                    MPI_Get_count(&status, MPI_CHAR, &this_round_align_size_tmp);
+                    std::memcpy(this_round_align_buffer, this_round_align_buffer_tmp, this_round_align_size_tmp);
+                    this_round_align_size = this_round_align_size_tmp;
+//                  fprintf(stderr, "rank%d now has %d\n", my_rank, this_round_align_size);
+
                 }
-                out_queue_[queueP2++] = make_pair(writeInfos[i].buffer, make_pair(writeInfos[i].buffer_len, real_pre_chunk_pos));
-                queueNumNow++;
-                real_pre_chunk_pos += writeInfos[i].buffer_len;
+
+
+
+                real_pre_chunk_pos = writeInfos[0].file_offset;
+                for(int i = 0; i < 64; i++) {
+                    if(zero_done) break;
+                    long long now_offset = real_pre_chunk_pos - real_pre_chunk_pos % my_alignment;
+                    int now_size = real_pre_chunk_pos % my_alignment;
+                    char* now_buffer = new char[now_size];
+                    if(i == 0) {
+                        memcpy(now_buffer, this_round_align_buffer, this_round_align_size);
+//                        if(this_round_align_size != now_size) {
+//                            fprintf(stderr, "rank%d GG size %d %d\n", my_rank, this_round_align_size, now_size);
+//                        }
+//                        assert(this_round_align_size == now_size);
+                    } else {
+                        memcpy(now_buffer, writeInfos[i - 1].buffer + writeInfos[i - 1].buffer_len - now_size, now_size);
+                    }
+                    CIPair now = make_pair(now_buffer, make_pair(now_size, now_offset));
+
+                    long long now2_offset = real_pre_chunk_pos;
+                    real_pre_chunk_pos += writeInfos[i].buffer_len;
+                    int now2_size = writeInfos[i].buffer_len - real_pre_chunk_pos % my_alignment;
+                    if(now2_size < 0) {
+                        now2_size = writeInfos[i].buffer_len;
+                        zero_done = true;
+                    }
+                    char* now2_buffer = writeInfos[i].buffer;
+                    CIPair now2 = make_pair(now2_buffer, make_pair(now2_size, now2_offset));
+
+                    //fprintf(stderr, "rank%d -%d- this chunk [%lld %d] - [%lld %d] - %d\n", my_rank, i, now_offset, now_size, now2_offset, now2_size, real_pre_chunk_pos % my_alignment);
+
+                    if(i == 63) {
+                        memcpy(this_round_align_buffer, writeInfos[i].buffer + now2_size, real_pre_chunk_pos % my_alignment);
+                        this_round_align_size = real_pre_chunk_pos % my_alignment;
+
+                    }
+
+                    while (queueNumNow >= queueSizeLim) {
+#ifdef Verbose
+                        //printf("waiting to push a chunk to out queue %d\n",out_len);
+#endif
+                        usleep(1000);
+                    }
+                    align_out_queue_[queueP2++] = make_pair(now, now2);
+                    queueNumNow++;
+
+                }
+
+                if(my_rank == comm_size - 1 || cmd_info_->splitWrite_) {
+                    std::memcpy(last_round_align_buffer, this_round_align_buffer, this_round_align_size);
+                    last_round_align_size = this_round_align_size;
+                }
+
+
+
+
+            } else {
+                long long real_pre_chunk_pos = writeInfos[0].file_offset;
+                for(int i = 0; i < 64; i++) {
+                    while (queueNumNow >= queueSizeLim) {
+#ifdef Verbose
+                        //printf("waiting to push a chunk to out queue %d\n",out_len);
+#endif
+                        usleep(1000);
+                    }
+                    out_queue_[queueP2++] = make_pair(writeInfos[i].buffer, make_pair(writeInfos[i].buffer_len, real_pre_chunk_pos));
+                    queueNumNow++;
+                    real_pre_chunk_pos += writeInfos[i].buffer_len;
+                }
             }
+
+
+
+
             t_push_q += GetTime() - tt0;
         }
 
@@ -1152,14 +1272,16 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
 /**
  * @brief a function to write data from out_data queue to file
  */
-void SeQc::WriteSeFastqTask() {
+void SeQc::AlignedWriteSeFastqTask() {
 #ifdef Verbose
     double t0 = GetTime();
 #endif
     int cnt = 0;
     long long tot_size = 0;
     bool overWhile = 0;
+    pair<CIPair, CIPair> now_pair;
     CIPair now;
+    CIPair now2;
     double t_wait = 0;
     double t_gz_slave = 0;
     double t_write = 0;
@@ -1168,7 +1290,7 @@ void SeQc::WriteSeFastqTask() {
     double t_del = 0;
     double t_free = 0;
 
-    char* tmp_buffer = (char*)aligned_alloc(my_alignment, 1024 * 1024);
+    char* tmp_buffer = (char*)aligned_alloc(my_alignment, 8 * 1024 * 1024);
     memset(tmp_buffer, 0, 1024 * 1024);
 
     while (true) {
@@ -1184,20 +1306,23 @@ void SeQc::WriteSeFastqTask() {
             usleep(10000);
         }
         if (overWhile) break;
-        now = out_queue_[queueP1++];
+        now_pair = align_out_queue_[queueP1++];
+        now = now_pair.first;
+        now2 = now_pair.second;
         queueNumNow--;
         t_wait += GetTime() - tt0;
 
-        //fprintf(stderr, "writer rank %d write get %p\n", my_rank, now.first);
 
         if (out_is_zip_) {
             if (cmd_info_->use_pigz_) {
                 fprintf(stderr, "use pigz TODO...\n");
                 exit(0);
             } else {
+                tot_size += now.second.first + now2.second.first;
                 tt0 = GetTime();
                 if(use_out_mem) {
                     memcpy(OutMemData, now.first, now.second.first);
+                    memcpy(OutMemData + now.second.first, now2.first, now2.second.first);
                 } else {
 #ifdef USE_LIBDEFLATE
 
@@ -1207,38 +1332,62 @@ void SeQc::WriteSeFastqTask() {
                         MPI_File_seek(fh, now.second.second, MPI_SEEK_SET);
                     }
                     MPI_File_write(fh, now.first, now.second.first, MPI_CHAR, &status);
-
-
 #else
-                    if(cmd_info_->splitWrite_ == 0) {
-                        if (lseek(fd, now.second.second, SEEK_SET) == -1) {
+//                    if(cmd_info_->splitWrite_ == 0) {
+                    assert(now.second.second + now.second.first == now2.second.second);
+                    if (lseek(fd, now.second.second, SEEK_SET) == -1) {
+                        fprintf(stderr, "seek pos %d\n", now.second.second);
+                        perror("lseek");
+                        close(fd);
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                        exit(1);
+                    }
+                    assert(now.second.second % my_alignment == 0);
+
+//                    }
+
+                    double tt000 = GetTime();
+                    memcpy(tmp_buffer, now.first, now.second.first);
+                    memcpy(tmp_buffer + now.second.first, now2.first, now2.second.first);
+                    t_copy += GetTime() - tt000;
+
+                    tt000 = GetTime();
+                    ssize_t written;
+                    if((now.second.first + now2.second.first) % my_alignment) {
+                        int new_fd = open(cmd_info_->out_file_name1_.c_str(), O_CREAT | O_RDWR, 0666);
+                        if (new_fd < 0) {
+                            perror("Failed to open file");
+                            MPI_Abort(MPI_COMM_WORLD, 1);
+                            return;
+                        }
+                        if (lseek(new_fd, now.second.second, SEEK_SET) == -1) {
                             fprintf(stderr, "seek pos %d\n", now.second.second);
                             perror("lseek");
                             close(fd);
                             MPI_Abort(MPI_COMM_WORLD, 1);
                             exit(1);
                         }
+                        written = write(new_fd, tmp_buffer, now.second.first + now2.second.first);
+                        close(new_fd);
+
+                    } else {
+                        written = write(fd, tmp_buffer, now.second.first + now2.second.first);
+                    }                    t_wwww += GetTime() - tt000;
+
+                    if (written == -1) {
+                        //fprintf(stderr, "write GG %d %p\n", now.second.first, now.first);
+                        fprintf(stderr, "write GG %d %p\n", now.second.first + now2.second.first, tmp_buffer);
+                        perror("write");
+                        close(fd);
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                        exit(1);
+                    } else if (written != now.second.first + now2.second.first) {
+                        fprintf(stderr, "Partial write at block gg %d %d\n", written, now.second.first + now2.second.first);
+                        close(fd);
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                        exit(1);
                     }
 
-                    double tt000 = GetTime();
-                    //memcpy(tmp_buffer, now.first, now.second.first);
-                    t_copy += GetTime() - tt000;
-                    tt000 = GetTime();
-					ssize_t written = write(fd, tmp_buffer, now.second.first);
-                    t_wwww += GetTime() - tt000;
-
-					if (written == -1) {
-						fprintf(stderr, "write GG %d %p\n", now.second.first, tmp_buffer);
-						perror("write");
-						close(fd);
-						MPI_Abort(MPI_COMM_WORLD, 1);
-						exit(1);
-					} else if (written != now.second.first) {
-						fprintf(stderr, "Partial write at block gg %d %d\n", written, now.second.first);
-						close(fd);
-						MPI_Abort(MPI_COMM_WORLD, 1);
-						exit(1);
-					}
 
                     //fseek(out_stream_, now.second.second, SEEK_SET);
                     //fwrite(now.first, sizeof(char), now.second.first, out_stream_);
@@ -1258,14 +1407,17 @@ void SeQc::WriteSeFastqTask() {
 
                 tt0 = GetTime();
                 delete[] now.first;
+                delete[] now2.first;
+
                 t_del += GetTime() - tt0;
             }
         } else {
-            tot_size += now.second.first;
-            if(now.second.first) {
+            tot_size += now.second.first + now2.second.first;
+            if(now.second.first + now2.second.first) {
                 tt0 = GetTime();
                 if(use_out_mem) {
                     memcpy(OutMemData, now.first, now.second.first);
+                    memcpy(OutMemData + now.second.first, now2.first, now2.second.first);
                 } else {
                     //fprintf(stderr, "rank %d write seek %lld\n", my_rank, now.second.second);
 
@@ -1278,31 +1430,59 @@ void SeQc::WriteSeFastqTask() {
                     //fprintf(stderr, "rank %d write ww done\n", my_rank);
 #else
 
-                    if(cmd_info_->splitWrite_ == 0) {
-                        if (lseek(fd, now.second.second, SEEK_SET) == -1) {
+
+//                    fprintf(stderr, "www offset %lld %d %lld %d\n", now.second.second, now.second.first, now2.second.second, now2.second.first);
+//                    if(cmd_info_->splitWrite_ == 0) {
+                    assert(now.second.second + now.second.first == now2.second.second);
+                    if (lseek(fd, now.second.second, SEEK_SET) == -1) {
+                        fprintf(stderr, "seek pos %d\n", now.second.second);
+                        perror("lseek");
+                        close(fd);
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                        exit(1);
+                    }
+                    assert(now.second.second % my_alignment == 0);
+//                    }
+                    double tt000 = GetTime();
+                    memcpy(tmp_buffer, now.first, now.second.first);
+                    memcpy(tmp_buffer + now.second.first, now2.first, now2.second.first);
+                    t_copy += GetTime() - tt000;
+
+                    //assert((now.second.first + now2.second.first) % my_alignment == 0);
+
+                    tt000 = GetTime();
+                    ssize_t written;
+                    if((now.second.first + now2.second.first) % my_alignment) {
+                        int new_fd = open(cmd_info_->out_file_name1_.c_str(), O_CREAT | O_RDWR, 0666);
+                        if (new_fd < 0) {
+                            perror("Failed to open file");
+                            MPI_Abort(MPI_COMM_WORLD, 1);
+                            return;
+                        }
+                        if (lseek(new_fd, now.second.second, SEEK_SET) == -1) {
                             fprintf(stderr, "seek pos %d\n", now.second.second);
                             perror("lseek");
                             close(fd);
                             MPI_Abort(MPI_COMM_WORLD, 1);
                             exit(1);
                         }
+                        written = write(new_fd, tmp_buffer, now.second.first + now2.second.first);
+                        close(new_fd);
+
+                    } else {
+                        written = write(fd, tmp_buffer, now.second.first + now2.second.first);
                     }
-                    double tt000 = GetTime();
-                    //memcpy(tmp_buffer, now.first, now.second.first);
-                    t_copy += GetTime() - tt000;
-                    tt000 = GetTime();
-					ssize_t written = write(fd, tmp_buffer, now.second.first);
                     t_wwww += GetTime() - tt000;
 
 					if (written == -1) {
 						//fprintf(stderr, "write GG %d %p\n", now.second.first, now.first);
-						fprintf(stderr, "write GG %d %p\n", now.second.first, tmp_buffer);
+						fprintf(stderr, "write GG %d %p\n", now.second.first + now2.second.first, tmp_buffer);
 						perror("write");
 						close(fd);
 						MPI_Abort(MPI_COMM_WORLD, 1);
 						exit(1);
-					} else if (written != now.second.first) {
-						fprintf(stderr, "Partial write at block gg %d %d\n", written, now.second.first);
+					} else if (written != now.second.first + now2.second.first) {
+						fprintf(stderr, "Partial write at block gg %d %d\n", written, now.second.first + now2.second.first);
 						close(fd);
 						MPI_Abort(MPI_COMM_WORLD, 1);
 						exit(1);
@@ -1316,6 +1496,7 @@ void SeQc::WriteSeFastqTask() {
 
                 tt0 = GetTime();
                 delete[] now.first;
+                delete[] now2.first;
                 t_del += GetTime() - tt0;
                 //fprintf(stderr, "rank %d write del done\n", my_rank);
             }
@@ -1396,6 +1577,249 @@ void SeQc::WriteSeFastqTask() {
 
 #endif
 }
+
+void SeQc::WriteSeFastqTask() {
+    double t0 = GetTime();
+    int cnt = 0;
+    long long tot_size = 0;
+    bool overWhile = 0;
+    CIPair now;
+    double t_wait = 0;
+    double t_gz_slave = 0;
+    double t_write = 0;
+    double t_copy = 0;
+    double t_wwww = 0;
+    double t_del = 0;
+    double t_free = 0;
+
+    char* tmp_buffer = (char*)aligned_alloc(my_alignment, 1024 * 1024);
+    memset(tmp_buffer, 0, 1024 * 1024);
+
+    while (true) {
+        double tt0 = GetTime();
+        while (queueNumNow == 0) {
+            if (done_thread_number_ == cmd_info_->thread_number_) {
+                overWhile = 1;
+                fprintf(stderr, "writer rank %d writer while break\n", my_rank);
+                break;
+            }
+
+            usleep(10000);
+        }
+        if (overWhile) break;
+        now = out_queue_[queueP1++];
+        queueNumNow--;
+        t_wait += GetTime() - tt0;
+
+        //fprintf(stderr, "writer rank %d write get %p\n", my_rank, now.first);
+
+        if (out_is_zip_) {
+            if (cmd_info_->use_pigz_) {
+                fprintf(stderr, "use pigz TODO...\n");
+                exit(0);
+            } else {
+                tt0 = GetTime();
+                if(use_out_mem) {
+                    memcpy(OutMemData, now.first, now.second.first);
+                } else {
+#ifdef USE_LIBDEFLATE
+
+#ifdef use_mpi_file
+
+                    if(cmd_info_->splitWrite_ == 0) {
+                        MPI_File_seek(fh, now.second.second, MPI_SEEK_SET);
+                    }
+                    MPI_File_write(fh, now.first, now.second.first, MPI_CHAR, &status);
+
+
+#else
+                    if(cmd_info_->splitWrite_ == 0) {
+                        if (lseek(fd, now.second.second, SEEK_SET) == -1) {
+                            fprintf(stderr, "seek pos %d\n", now.second.second);
+                            perror("lseek");
+                            close(fd);
+                            MPI_Abort(MPI_COMM_WORLD, 1);
+                            exit(1);
+                        }
+                    }
+
+                    double tt000 = GetTime();
+                    //memcpy(tmp_buffer, now.first, now.second.first);
+                    t_copy += GetTime() - tt000;
+                    tt000 = GetTime();
+                    ssize_t written = write(fd, tmp_buffer, now.second.first);
+                    t_wwww += GetTime() - tt000;
+
+                    if (written == -1) {
+                        fprintf(stderr, "write GG %d %p\n", now.second.first, tmp_buffer);
+                        perror("write");
+                        close(fd);
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                        exit(1);
+                    } else if (written != now.second.first) {
+                        fprintf(stderr, "Partial write at block gg %d %d\n", written, now.second.first);
+                        close(fd);
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                        exit(1);
+                    }
+
+                    //fseek(out_stream_, now.second.second, SEEK_SET);
+                    //fwrite(now.first, sizeof(char), now.second.first, out_stream_);
+#endif
+
+
+#else
+                    int written = gzwrite(zip_out_stream, now.first, now.second.first);
+                    if (written != now.second.first) {
+                        printf("gzwrite error\n");
+                        exit(0);
+                    }
+#endif
+                }
+
+                t_write += GetTime() - tt0;
+
+                tt0 = GetTime();
+                delete[] now.first;
+                t_del += GetTime() - tt0;
+            }
+        } else {
+            tot_size += now.second.first;
+            if(now.second.first) {
+                tt0 = GetTime();
+                if(use_out_mem) {
+                    memcpy(OutMemData, now.first, now.second.first);
+                } else {
+                    //fprintf(stderr, "rank %d write seek %lld\n", my_rank, now.second.second);
+
+#ifdef use_mpi_file
+                    if(cmd_info_->splitWrite_ == 0) {
+                        MPI_File_seek(fh, now.second.second, MPI_SEEK_SET);
+                    }
+                    //fprintf(stderr, "rank %d write ww %lld\n", my_rank, now.second.first);
+                    MPI_File_write(fh, now.first, now.second.first, MPI_CHAR, &status);
+                    //fprintf(stderr, "rank %d write ww done\n", my_rank);
+#else
+
+                    if(cmd_info_->splitWrite_ == 0) {
+                        if (lseek(fd, now.second.second, SEEK_SET) == -1) {
+                            fprintf(stderr, "seek pos %d\n", now.second.second);
+                            perror("lseek");
+                            close(fd);
+                            MPI_Abort(MPI_COMM_WORLD, 1);
+                            exit(1);
+                        }
+                    }
+                    double tt000 = GetTime();
+                    //memcpy(tmp_buffer, now.first, now.second.first);
+                    t_copy += GetTime() - tt000;
+                    tt000 = GetTime();
+                    ssize_t written = write(fd, tmp_buffer, now.second.first);
+                    t_wwww += GetTime() - tt000;
+
+                    if (written == -1) {
+                        //fprintf(stderr, "write GG %d %p\n", now.second.first, now.first);
+                        fprintf(stderr, "write GG %d %p\n", now.second.first, tmp_buffer);
+                        perror("write");
+                        close(fd);
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                        exit(1);
+                    } else if (written != now.second.first) {
+                        fprintf(stderr, "Partial write at block gg %d %d\n", written, now.second.first);
+                        close(fd);
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                        exit(1);
+                    }
+
+                    //fseek(out_stream_, now.second.second, SEEK_SET);
+                    //fwrite(now.first, sizeof(char), now.second.first, out_stream_);
+#endif
+                }
+                t_write += GetTime() - tt0;
+
+                tt0 = GetTime();
+                delete[] now.first;
+                t_del += GetTime() - tt0;
+                //fprintf(stderr, "rank %d write del done\n", my_rank);
+            }
+            //fprintf(stderr, "writer %d %d done\n", my_rank, cnt++);
+        }
+    }
+
+    if(cmd_info_->splitWrite_ == 0) {
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+    //fprintf(stderr, "writer rank%d write donedone\n", my_rank);
+    double tt0 = GetTime();
+    if (out_is_zip_) {
+        if (cmd_info_->use_pigz_) {
+            fprintf(stderr, "use pigz TODO...\n");
+            exit(0);
+        } else {
+#ifdef USE_LIBDEFLATE
+
+#ifdef use_mpi_file
+            MPI_File_close(&fh);
+#else
+            close(fd);
+            //fclose(out_stream_);
+            //if(my_rank == 0) {
+            //    truncate(cmd_info_->out_file_name1_.c_str(), sizeof(char) * zip_now_pos_);
+            //}
+#endif
+            //off_idx.close();
+
+#else
+            if (zip_out_stream) {
+                gzflush(zip_out_stream, Z_FINISH);
+                gzclose(zip_out_stream);
+                zip_out_stream = NULL;
+            }
+#endif
+        }
+    } else {
+#ifdef use_mpi_file
+        MPI_File_close(&fh);
+#else
+        close(fd);
+        //fclose(out_stream_);
+        //if(my_rank == 0) {
+        //    truncate(cmd_info_->out_file_name1_.c_str(), sizeof(char) * now_pos_);
+        //}
+#endif
+
+    }
+    t_free += GetTime() - tt0;
+
+    if(my_rank == 0 && out_is_zip_) {
+        tt0 = GetTime();
+        ofstream ofs(cmd_info_->out_file_name1_, ios::binary | ios::app);
+        for (const auto& pair : out_gz_block_sizes) {
+            ofs.write(reinterpret_cast<const char*>(&pair.second), sizeof(size_t));
+        }
+        size_t vector_size = out_gz_block_sizes.size();
+        ofs.write(reinterpret_cast<const char*>(&vector_size), sizeof(size_t));
+        ofs.close();
+        printf("writer final cost %lf\n", GetTime() - tt0);
+    }
+
+
+#ifdef Verbose
+    printf("writer wait queue cost %.4f\n", t_wait);
+    printf("writer gz slave cost %.4f\n", t_gz_slave);
+    printf("writer write cost %.4f\n", t_write);
+    printf("writer copy cost %.4f\n", t_copy);
+    printf("writer wwww cost %.4f\n", t_wwww);
+    printf("writer del cost %.4f\n", t_del);
+    printf("writer free cost %.4f\n", t_free);
+    //printf("writer %d cost %lf, tot size %lld\n", my_rank, GetTime() - t0, tot_size);
+    fprintf(stderr, "writer %d cost %lf, tot size %lld\n", my_rank, GetTime() - t0, tot_size);
+    printf("writer %d done in func\n", my_rank);
+    //printf("write %d cost %.5f --- %lld\n", my_rank, GetTime() - t0, tot_size);
+
+#endif
+}
+
 
 
 bool checkStates(State* s1, State* s2) {
@@ -1501,7 +1925,6 @@ void SeQc::ProcessSeFastq() {
     auto **p_thread_info = new ThreadInfo *[slave_num];
     for (int t = 0; t < slave_num; t++) {
         p_thread_info[t] = new ThreadInfo(cmd_info_, false);
-        printf("done malloc thread %d\n", t);
     }
     printf("thread done\n");
     rabbit::uint32 tmpSize = SWAP1_SIZE;
@@ -1534,7 +1957,8 @@ void SeQc::ProcessSeFastq() {
 
     thread *write_thread;
     if (cmd_info_->write_data_) {
-        write_thread = new thread(bind(&SeQc::WriteSeFastqTask, this));
+        if(use_align_write) write_thread = new thread(bind(&SeQc::AlignedWriteSeFastqTask, this));
+        else write_thread = new thread(bind(&SeQc::WriteSeFastqTask, this));
     }
     //tagg
     //thread producer(bind(&SeQc::ProducerSeFastqTask, this, cmd_info_->in_file_name1_, fastqPool, ref(queue1)));

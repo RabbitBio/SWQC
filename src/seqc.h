@@ -68,6 +68,8 @@ private:
 
     void WriteSeFastqTask();
 
+    void AlignedWriteSeFastqTask();
+
     void ProcessFormatQCWrite(bool &allIsNull, std::vector <neoReference> *data, std::vector <neoReference> *pass_data, std::vector <neoReference> *pre_pass_data,
                               std::vector <rabbit::fq::FastqDataChunk *> fqdatachunks, std::vector <rabbit::fq::FastqDataChunk *> pre_fqdatachunks,
                               qc_data *para, rabbit::fq::FastqDataPool *fastq_data_pool);
@@ -78,6 +80,7 @@ private:
     CmdInfo *cmd_info_;
 
     Filter *filter_;
+    std::pair<CIPair, CIPair> *align_out_queue_;
     CIPair *out_queue_;
     //QChunkItem *out_queue_;
     std::vector<rabbit::fq::FastqDataChunk *> *p_out_queue_;
@@ -128,6 +131,8 @@ private:
     std::atomic_int producerStop;
     std::mutex mylock;
     std::mutex p_mylock;
+
+    bool use_align_write;
 
     int64_t *part_sizes;
     std::vector<std::pair<int, size_t>> out_gz_block_sizes;
