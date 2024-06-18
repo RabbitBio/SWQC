@@ -19,7 +19,11 @@ namespace rabbit {
         end_pos = 0;
         t_memcpy = 0;
         t_read = 0;
-        MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+        read_cnt = 0;
+        read_cnt_gg = 0;
+            
+
+        //MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
 
         if (ends_with(fileName_, ".gz") || isZipped) {
 #ifdef USE_LIBDEFLATE
@@ -74,7 +78,6 @@ namespace rabbit {
             buffer_tot_size = 0;
             buffer_now_pos = 0;
             buffer_now_offset = 0;
-            read_cnt = 0;
             align_end = false;
             input_file = fopen(fileName_.c_str(), "rb");
             if (input_file == NULL) {
@@ -100,7 +103,7 @@ namespace rabbit {
             buffer_last_size = 0;
             //TODO
             buffer_now_offset = file_offset;
-            fprintf(stderr, "rank%d buffer_now_offset %lld\n", my_rank, buffer_now_offset);
+            //fprintf(stderr, "rank%d buffer_now_offset %lld\n", my_rank, buffer_now_offset);
 
             fd = open(fileName_.c_str(), O_RDWR | O_DIRECT);
             //fd = open(fileName_.c_str(), O_RDWR);
@@ -131,6 +134,7 @@ namespace rabbit {
 #endif
             this->isZipped = true;
         } else {
+            fprintf(stderr, "start fqreader init\n");
             start_pos = startPos;
             end_pos = endPos;
             if(start_pos == end_pos) {
@@ -140,7 +144,7 @@ namespace rabbit {
                 end_pos = gFile.tellg();
                 gFile.close();
             }
-            //fprintf(stderr, "FileReader [%lld %lld]\n", start_pos, end_pos);
+            fprintf(stderr, "FileReader [%lld %lld]\n", start_pos, end_pos);
             has_read = 0;
             total_read = end_pos - start_pos;
             align_end = false;
@@ -189,7 +193,7 @@ namespace rabbit {
     }
 
     FileReader::~FileReader() {
-        fprintf(stderr, "time %lf %lf\n", t_memcpy, t_read);
+        fprintf(stderr, "time %lf %lf, cnt %d / %d\n", t_memcpy, t_read, read_cnt_gg, read_cnt);
         if (mIgInbuf != NULL) delete mIgInbuf;
         if (read_in_mem) delete[] MemData;
         if (mFile != NULL) {
@@ -286,6 +290,7 @@ namespace rabbit {
     }
 
     int64 FileReader::ReadAlign(byte *memory_, int64_t offset_, uint64 size_) {
+        read_cnt++;
         offset_read = offset_;
         off_t offset = offset_;
         if (lseek(fd, offset, SEEK_SET) == (off_t)-1) {
@@ -303,8 +308,12 @@ namespace rabbit {
         //fprintf(stderr, "%d == read21 byte, -- %d -- %p\n", int(t_memcpy), size_, memory_);
 
         double t0 = GetTime();
+        int n;
+        bool is_aligned_addr = ((uintptr_t)memory_ % MY_PAGE_SIZE) == 0;
+        if(!is_aligned_addr) n = read(fd, buffer_test, size_);
+        else n = read(fd, memory_, size_);
         //int n = read(fd, buffer_test, size_);
-        int n = read(fd, memory_, size_);
+        //int n = read(fd, memory_, size_);
         t_read += GetTime() - t0;
 
         //fprintf(stderr, "read22 %d byte, -- %d\n", n, size_);
@@ -313,9 +322,12 @@ namespace rabbit {
                 fprintf(stderr, "Reached end of file unexpectedly. Only %zd bytes were read.\n", n);
             } else if (n == -1) {
                 //fprintf(stderr, "GG1 %zu %d %p\n", size_, n, buffer_test);
-                fprintf(stderr, "GG2 %zu %d %p\n", size_, n, memory_);
-                fprintf(stderr, "Error reading file: %s\n", strerror(errno));
-                exit(0);
+                //fprintf(stderr, "GG2 %zu %d %p\n", size_, n, memory_);
+                //fprintf(stderr, "Error reading file: %s\n", strerror(errno));
+                //exit(0);
+                n = read(fd, buffer_test, size_);
+                is_aligned_addr = 0;
+
             }
         }
         if(offset_read + n >= end_pos) {
@@ -323,9 +335,12 @@ namespace rabbit {
             n = end_pos - offset_read;
         } 
 
-        //t0 = GetTime();
-        //memcpy(memory_, buffer_test, n);
-        //t_memcpy += GetTime() - t0;
+        t0 = GetTime();
+        if(!is_aligned_addr) {
+            read_cnt_gg++;
+            memcpy(memory_, buffer_test, n);
+        }
+        t_memcpy += GetTime() - t0;
 
         return n;
     }

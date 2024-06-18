@@ -490,7 +490,7 @@ void SeQc::ProducerSeFastqTask64(string file, rabbit::fq::FastqDataPool *fastq_d
         if ((fqdatachunk == NULL) || (fqdatachunk != NULL && fqdatachunk->size == 1ll << 32)) {
             double tt1 = GetTime();
             if(tmp_chunks.size()) {
-                fprintf(stderr, "ppp put last %d\n", tmp_chunks.size());
+//                fprintf(stderr, "ppp put last %d\n", tmp_chunks.size());
                 while (p_queueNumNow >= p_queueSizeLim) {
                     usleep(100);
                 }
@@ -1171,25 +1171,6 @@ void SeQc::WriteSeFastqTask() {
     char* tmp_buffer = (char*)aligned_alloc(my_alignment, 1024 * 1024);
     memset(tmp_buffer, 0, 1024 * 1024);
 
-    //vector<int>sizes;
-
-    //int fd_baba = open(cmd_info_->out_file_name1_.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0666);
-    //if (fd_baba == -1) {
-    //    perror("Failed to open file for writing");
-    //    return;
-    //}
-
-
-    //int fd2 = open("outputfile_write.dat", O_CREAT | O_RDWR | O_DIRECT, 0666);
-    //if (fd2 == -1) {
-    //    perror("Failed to open file for writing");
-    //    return;
-    //}
-
-
-    //double t_wwww2 = 0;
-    //long long wwwsum = 0;
-
     while (true) {
         double tt0 = GetTime();
         while (queueNumNow == 0) {
@@ -1229,13 +1210,16 @@ void SeQc::WriteSeFastqTask() {
 
 
 #else
-                    if (lseek(fd, now.second.second, SEEK_SET) == -1) {
-                        fprintf(stderr, "seek pos %d\n", now.second.second);
-						perror("lseek");
-						close(fd);
-						MPI_Abort(MPI_COMM_WORLD, 1);
-						exit(1);
-					}
+                    if(cmd_info_->splitWrite_ == 0) {
+                        if (lseek(fd, now.second.second, SEEK_SET) == -1) {
+                            fprintf(stderr, "seek pos %d\n", now.second.second);
+                            perror("lseek");
+                            close(fd);
+                            MPI_Abort(MPI_COMM_WORLD, 1);
+                            exit(1);
+                        }
+                    }
+
                     double tt000 = GetTime();
                     //memcpy(tmp_buffer, now.first, now.second.first);
                     t_copy += GetTime() - tt000;
@@ -1244,7 +1228,6 @@ void SeQc::WriteSeFastqTask() {
                     t_wwww += GetTime() - tt000;
 
 					if (written == -1) {
-						//fprintf(stderr, "write GG %d %p\n", now.second.first, now.first);
 						fprintf(stderr, "write GG %d %p\n", now.second.first, tmp_buffer);
 						perror("write");
 						close(fd);
@@ -1295,13 +1278,15 @@ void SeQc::WriteSeFastqTask() {
                     //fprintf(stderr, "rank %d write ww done\n", my_rank);
 #else
 
-					if (lseek(fd, now.second.second, SEEK_SET) == -1) {
-                        fprintf(stderr, "seek pos %d\n", now.second.second);
-						perror("lseek");
-						close(fd);
-						MPI_Abort(MPI_COMM_WORLD, 1);
-						exit(1);
-					}
+                    if(cmd_info_->splitWrite_ == 0) {
+                        if (lseek(fd, now.second.second, SEEK_SET) == -1) {
+                            fprintf(stderr, "seek pos %d\n", now.second.second);
+                            perror("lseek");
+                            close(fd);
+                            MPI_Abort(MPI_COMM_WORLD, 1);
+                            exit(1);
+                        }
+                    }
                     double tt000 = GetTime();
                     //memcpy(tmp_buffer, now.first, now.second.first);
                     t_copy += GetTime() - tt000;
@@ -1505,16 +1490,20 @@ bool checkStates(State* s1, State* s2) {
 
 void SeQc::ProcessSeFastq() {
     
+    printf("init se processer\n");
     
     //TODO
     //if(my_rank == 0) block_size = 6 * (1 << 20);
     //else block_size = 4 * (1 << 20);
     auto *fastqPool = new rabbit::fq::FastqDataPool(Q_lim_se * 64, BLOCK_SIZE);
+    printf("pool done\n");
     //rabbit::core::TDataQueue<rabbit::fq::FastqDataChunk> queue1(Q_lim_se * 64, 1);
     auto **p_thread_info = new ThreadInfo *[slave_num];
     for (int t = 0; t < slave_num; t++) {
         p_thread_info[t] = new ThreadInfo(cmd_info_, false);
+        printf("done malloc thread %d\n", t);
     }
+    printf("thread done\n");
     rabbit::uint32 tmpSize = SWAP1_SIZE;
     if (cmd_info_->seq_len_ <= 200) tmpSize = SWAP2_SIZE;
 
@@ -1523,9 +1512,8 @@ void SeQc::ProcessSeFastq() {
     } else {
         fqFileReader = new rabbit::fq::FastqFileReader(cmd_info_->in_file_name1_, *fastqPool, "", in_is_zip_, tmpSize, start_pos_, end_pos_, use_in_mem);
     }
-    if(use_in_mem) {
-        MPI_Barrier(MPI_COMM_WORLD);
-    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
 
     double ttt = GetTime();
 
@@ -1574,6 +1562,8 @@ void SeQc::ProcessSeFastq() {
 
     MPI_Barrier(MPI_COMM_WORLD);
 
+    fqFileReader->PrintTime(); 
+
     printf("all pro write done2\n");
     printf("TOT TIME1 %lf\n", GetTime() - ttt);
 
@@ -1592,8 +1582,8 @@ void SeQc::ProcessSeFastq() {
 
     State* pre_state_tmp;
     State* aft_state_tmp;
-    if(cmd_info_->do_overrepresentation_) {
-    //if(0) {
+    //if(cmd_info_->do_overrepresentation_) {
+    if(0) {
         pre_state_tmp = State::MergeStatesSlave(pre_vec_state);
         aft_state_tmp = State::MergeStatesSlave(aft_vec_state);
     } else {

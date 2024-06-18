@@ -115,6 +115,7 @@ namespace rabbit {
             double t_memcpy;
             double t_read;
             int read_cnt;
+            int read_cnt_gg;
             int my_rank;
 
 			gzFile mZipFile = NULL;

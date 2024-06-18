@@ -44,9 +44,11 @@ namespace rabbit {
 
             const uint32 maxPartNum;
             const uint32 bufferPartSize;
+            double time_pool_0 = 0;
+            double time_pool_1 = 0;
 
             part_pool availablePartsPool;
-            part_pool allocatedPartsPool;
+            //part_pool allocatedPartsPool;
 
             //th::mutex mutex;
             //th::condition_variable partsAvailableCondition;
@@ -63,15 +65,19 @@ namespace rabbit {
              */
             TDataPool(uint32 maxPartNum_ = DefaultMaxPartNum, uint32 bufferPartSize_ = DefaultBufferPartSize)
                 : maxPartNum(maxPartNum_), bufferPartSize(bufferPartSize_), partNum(0) {
-                availablePartsPool.resize(maxPartNum);
-                allocatedPartsPool.reserve(maxPartNum);
+                for(int i = 0; i < maxPartNum; i++) {
+                    availablePartsPool.push_back(new DataType(bufferPartSize));
+                }
+                //availablePartsPool.resize(maxPartNum);
+                //allocatedPartsPool.reserve(maxPartNum);
             }
 
             ~TDataPool() {
-                for (typename part_pool::iterator i = allocatedPartsPool.begin(); i != allocatedPartsPool.end(); ++i) {
-                    ASSERT(*i != NULL);
-                    delete *i;
-                }
+                fprintf(stderr, "~TDataPool time : %lf %lf\n", time_pool_0, time_pool_1);
+                //for (typename part_pool::iterator i = allocatedPartsPool.begin(); i != allocatedPartsPool.end(); ++i) {
+                //    ASSERT(*i != NULL);
+                //    delete *i;
+                //}
             }
 
             /**
@@ -83,23 +89,30 @@ namespace rabbit {
             void Acquire(DataType *&part_) {
                 //th::unique_lock<th::mutex> lock(mutex);
 
+                double t0 = GetTime(); 
                 while (partNum >= maxPartNum) {
+                    usleep(100);
                     //partsAvailableCondition.wait(lock);
                 }
+                time_pool_0 += GetTime() - t0;
+
+                t0 = GetTime(); 
                 ASSERT(availablePartsPool.size() > 0);
 
                 DataType *&pp = availablePartsPool.back();
                 availablePartsPool.pop_back();
                 if (pp == NULL) {
-                    //printf("new size %d\n", bufferPartSize);
-                    pp = new DataType(bufferPartSize);
-                    allocatedPartsPool.push_back(pp);
+                    printf("GG new null%p\n", pp);
+                    exit(0);
+                    //pp = new DataType(bufferPartSize);
+                    //allocatedPartsPool.push_back(pp);
                 } else {
                     pp->Reset();
                 }
 
                 partNum++;
                 part_ = pp;
+                time_pool_1 += GetTime() - t0;
             }
 
             /**
@@ -112,8 +125,7 @@ namespace rabbit {
 
                 ASSERT(part_ != NULL);
                 ASSERT(partNum != 0 && partNum <= maxPartNum);
-                ASSERT(std::find(allocatedPartsPool.begin(), allocatedPartsPool.end(), part_) !=
-                       allocatedPartsPool.end());
+                //ASSERT(std::find(allocatedPartsPool.begin(), allocatedPartsPool.end(), part_) != allocatedPartsPool.end());
                 availablePartsPool.push_back((DataType *) part_);
                 partNum--;
 

@@ -308,7 +308,6 @@ namespace rabbit {
             bool MemDataReadFinish = 0;
             
             int read_cnt = 0;
-            
             int64_t endAlignPos = 0;
             int64_t endAlignPos2 = 0;
 
@@ -324,7 +323,11 @@ namespace rabbit {
             bool MemDataReadFinish2 = 0;
 
         public:
-
+            double time0 = 0;
+            double time1 = 0;
+            double time2 = 0;
+            
+         
             /**
              * @brief FastaFileReader Constructor
              * @param fileName_ Fastq file name
@@ -389,11 +392,12 @@ namespace rabbit {
             }
 
             ~FastqFileReader() {
-                //fprintf(stderr, "tot_read_size2 %lld\n", tot_read_size2);
+                //fprintf(stderr, "time %llf %lf %lf\n", time0, time1, time2);
                 if (mFqReader != NULL) delete mFqReader;
                 if (mFqReader2 != NULL) delete mFqReader2;
             }
 
+            void PrintTime();
             void MemDataReader();
             void MemDataReader2();
 
@@ -429,6 +433,8 @@ namespace rabbit {
             bool ReadNextInterChunk_(FastqDataChunk *chunk_);
 
             FastqDataPairChunk *readNextPairChunk();
+
+            FastqDataPairChunk *readNextPairChunkAlign();
 
             FastqDataPairChunk *readNextPairChunkFromMem(int64 offset = -1, int64 lim_size = 1e9);
 

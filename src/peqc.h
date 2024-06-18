@@ -97,6 +97,8 @@ private:
     std::atomic_int done_thread_number_;
     FILE *out_stream1_;
     FILE *out_stream2_;
+    int fd1;
+    int fd2;
     MPI_File fh1;
     MPI_File fh2;
     MPI_Status status1;

@@ -660,7 +660,9 @@ int main(int argc, char **argv) {
             double t2 = GetTime();
             printf("now doing overrepresent preprocessing part\n");
             Adapter::PreOverAnalyze(cmd_info.in_file_name1_, cmd_info.hot_seqs_, cmd_info.eva_len_);
+            cmd_info.eva_len_ = mx_len;
             Adapter::PreOverAnalyze(cmd_info.in_file_name2_, cmd_info.hot_seqs2_, cmd_info.eva_len2_);
+            cmd_info.eva_len2_ = mx_len;
             printf("overrepresent preprocessing part done\n");
             printf("read1 has %d hot sequence\n", cmd_info.hot_seqs_.size());
             printf("read2 has %d hot sequence\n", cmd_info.hot_seqs2_.size());
@@ -721,6 +723,7 @@ int main(int argc, char **argv) {
             double t2 = GetTime();
             printf("now doing overrepresent preprocessing part\n");
             Adapter::PreOverAnalyze(cmd_info.in_file_name1_, cmd_info.hot_seqs_, cmd_info.eva_len_);
+            cmd_info.eva_len_ = mx_len;
             printf("overrepresent preprocessing part done\n");
             printf("total %d hot sqes\n", cmd_info.hot_seqs_.size());
 #ifdef Verbose

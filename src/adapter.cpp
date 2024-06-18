@@ -142,6 +142,24 @@ struct preOverData{
 
 void Adapter::PreOverAnalyze(string file_name, vector<string> &hot_seqs, int &eva_len) {
 
+    bool read_orp_seqs_from_file = 1;
+
+    if(read_orp_seqs_from_file) {
+        ifstream iff;
+        string orp_seq_name = file_name + ".orp_seqs";  
+        iff.open(orp_seq_name);
+        if (!iff.is_open()) {
+            cerr << "Error opening file: " << orp_seq_name << endl;
+            return;
+        }
+        string line;
+        while (getline(iff, line)) {
+            hot_seqs.push_back(line);
+        }
+        iff.close();
+        return;
+    }
+
 #ifdef Verbose
     double t0 = GetTime();
 #endif
@@ -307,7 +325,7 @@ void Adapter::PreOverAnalyze(string file_name, vector<string> &hot_seqs, int &ev
 #endif
 
     athread_init();
-    bool use_slave = 1;
+    bool use_slave = 0;
     if(use_slave) {
         vector<int> hot_seqs_id[64];
         int size_outs[64] = {0};

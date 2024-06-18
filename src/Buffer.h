@@ -18,7 +18,7 @@ zekun.yin@mail.sdu.edu.cn
 #include "utils.h"
 #include "globalMutex.h"
 
-//#define use_baba_align_method
+#define use_baba_align_method
 
 
 
@@ -45,9 +45,9 @@ namespace rabbit {
                     offset_align = 0;
 #ifdef use_baba_align_method
                     //fprintf(stderr, "this size %d, tot id %d\n", size_, tot_id);
-                    if(size_ != my_buffer_size) {
-                        fprintf(stderr, "GG size != BLOCK_SIZE in Buffer.h : %d %d\n", size_, my_buffer_size);
-                    }
+                    //if(size_ != my_buffer_size) {
+                    //    fprintf(stderr, "GG size != BLOCK_SIZE in Buffer.h : %d %d\n", size_, my_buffer_size);
+                    //}
 #endif
 
 #if (USE_64BIT_MEMORY)
@@ -57,7 +57,7 @@ namespace rabbit {
 #else
 
 # ifdef use_baba_align_method
-                    if(size_ > my_buffer_size) {
+                    if(size_ > my_buffer_size || tot_id >= 256) {
                         buffer = new byte[size_];
                     } else {
                         buffer = (byte*)buffers[tot_id++];

@@ -46,7 +46,7 @@ std::map<char*, int> myMap;
 
 
 
-constexpr size_t my_num_buffers = 1024;
+constexpr size_t my_num_buffers = 256;
 //constexpr size_t my_num_buffers2 = 64;
 constexpr size_t my_buffer_size = 1024 * 1024; // 1MB
 constexpr size_t my_alignment = 8192; // 8192B (8KB)

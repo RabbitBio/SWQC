@@ -794,6 +794,92 @@ namespace rabbit {
             return pair;
         }
 
+        void FastqFileReader::PrintTime() {
+            fprintf(stderr, "fqreader time : %lf %lf %lf\n", time0, time1, time2); 
+        }
+
+
+        FastqDataPairChunk *FastqFileReader::readNextPairChunkAlign() {
+            if (mFqReader->FinishRead()) {
+                assert(mFqReader2->FinishRead());
+                return NULL;
+            }
+            double t0 = GetTime();
+
+            FastqDataPairChunk *pair = new FastqDataPairChunk;
+
+            FastqDataChunk *leftPart = NULL;
+            recordsPool.Acquire(leftPart);
+
+            FastqDataChunk *rightPart = NULL;
+            recordsPool.Acquire(rightPart);
+            time0 += GetTime() - t0;
+
+
+            //-----------------read left chunk---------------------//
+            uchar *data = leftPart->data.Pointer();
+            uint64 cbufSize = leftPart->data.Size();
+            leftPart->size = 0;
+            int64 toRead = cbufSize;
+            if(read_cnt == 0) {
+                nowAlignPos -= nowAlignPos % MY_PAGE_SIZE;
+            }
+            t0 = GetTime();
+            int64 r = mFqReader->ReadAlign(data, nowAlignPos, toRead);
+            time1 += GetTime() - t0;
+            if (!mFqReader->FinishRead()) {
+                cbufSize = r;
+                uint64 chunkEnd = cbufSize;
+                chunkEnd = cbufSize - (cbufSize < GetNxtBuffSize ? cbufSize : GetNxtBuffSize);
+                chunkEnd = GetNextRecordPos_(data, chunkEnd, cbufSize);
+                leftPart->data.offset_align = nowAlignEnd - nowAlignPos;
+                nowAlignPos += chunkEnd - chunkEnd % MY_PAGE_SIZE;
+                nowAlignEnd += chunkEnd - leftPart->data.offset_align;
+                leftPart->size = chunkEnd - 1;
+                if (usesCrlf) leftPart->size -= 1;
+            } else {
+                leftPart->data.offset_align = nowAlignEnd - nowAlignPos;
+                leftPart->size += r - 1;
+                if (usesCrlf) leftPart->size -= 1;
+                mFqReader->setEof();
+            }
+            //------read left chunk end------//
+
+            //-----------------read right chunk---------------------//
+            uchar *data_right = rightPart->data.Pointer();
+            uint64 cbufSize_right = rightPart->data.Size();
+            rightPart->size = 0;
+            toRead = cbufSize_right;
+            if(read_cnt == 0) {
+                nowAlignPos2 -= nowAlignPos2 % MY_PAGE_SIZE;
+            }
+            read_cnt++;
+            t0 = GetTime();
+            r = mFqReader2->ReadAlign(data_right, nowAlignPos2, toRead);
+            time2 += GetTime() - t0;
+            if (!mFqReader2->FinishRead()) {
+                cbufSize = r;
+                uint64 chunkEnd = cbufSize;
+                chunkEnd = cbufSize - (cbufSize < GetNxtBuffSize ? cbufSize : GetNxtBuffSize);
+                chunkEnd = GetNextRecordPos_(data, chunkEnd, cbufSize);
+                rightPart->data.offset_align = nowAlignEnd2 - nowAlignPos2;
+                nowAlignPos2 += chunkEnd - chunkEnd % MY_PAGE_SIZE;
+                nowAlignEnd2 += chunkEnd - rightPart->data.offset_align;
+                rightPart->size = chunkEnd - 1;
+                if (usesCrlf) rightPart->size -= 1;
+            } else {
+                rightPart->data.offset_align = nowAlignEnd2 - nowAlignPos2;
+                rightPart->size += r - 1;
+                if (usesCrlf) rightPart->size -= 1;
+            }
+            //--------------read right chunk end---------------------//
+
+            pair->left_part = leftPart;
+            pair->right_part = rightPart;
+            return pair;
+        }
+
+
         FastqDataPairChunk *FastqFileReader::readNextPairChunk() {
 
 
