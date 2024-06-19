@@ -67,6 +67,8 @@ private:
 //                                  rabbit::core::TDataQueue<rabbit::fq::FastqDataChunk> &dq);
 
     void WriteSeFastqTask12();
+
+    void AlignedWriteSeFastqTask12();
 //
 //    void WriteSeFastqTask1();
 //
@@ -92,6 +94,7 @@ private:
     CIPair *out_queue1_;
     CIPair *out_queue2_;
     //std::pair<QChunkItem, QChunkItem> *out_queue_;
+    std::pair<std::pair<CIPair, CIPair>, std::pair<CIPair, CIPair>> *align_out_queue_;
     std::pair<CIPair, CIPair> *out_queue_;
     std::vector<rabbit::fq::FastqDataPairChunk *> *p_out_queue_;
     std::atomic_int done_thread_number_;
@@ -170,6 +173,7 @@ private:
     std::atomic_int producerStop;
     std::mutex mylock;
     std::mutex p_mylock;
+    bool use_align_write;
 
     int64_t *part_sizes;
     std::vector<std::pair<int, size_t>> out_gz_block_sizes1;

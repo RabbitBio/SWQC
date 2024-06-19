@@ -1372,7 +1372,8 @@ void SeQc::AlignedWriteSeFastqTask() {
 
                     } else {
                         written = write(fd, tmp_buffer, now.second.first + now2.second.first);
-                    }                    t_wwww += GetTime() - tt000;
+                    }
+                    t_wwww += GetTime() - tt000;
 
                     if (written == -1) {
                         //fprintf(stderr, "write GG %d %p\n", now.second.first, now.first);
