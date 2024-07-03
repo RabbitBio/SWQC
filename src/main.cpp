@@ -579,16 +579,14 @@ int main(int argc, char **argv) {
     //    printf("now use %d thread to do QC operations\n", cmd_info.thread_number_);
     //else
     //    printf("now use %d threads to do QC operations\n", cmd_info.thread_number_);
-    //int mx_len = Adapter::EvalMaxLen(cmd_info.in_file_name1_);
-    int mx_len = 100;
-    if (cmd_info.in_file_name1_.find("SRR24") != std::string::npos) {
-        mx_len = 100;
-    } else 
-//if (cmd_info.in_file_name1_.find("SRR16") != std::string::npos) 
-    {
-        mx_len = 150;
-    }
-    printf("mx_len %d\n", mx_len);
+    int mx_len = Adapter::EvalMaxLen(cmd_info.in_file_name1_);
+    //int mx_len = 100;
+    //if (cmd_info.in_file_name1_.find("SRR24") != std::string::npos) {
+    //    mx_len = 100;
+    //} else {
+    //    mx_len = 150;
+    //}
+    //printf("mx_len %d\n", mx_len);
     cmd_info.seq_len_ = mx_len;
     if (cmd_info.adapter_fasta_file_.length() > 0) {
         printf("loading adatper from %s\n", cmd_info.adapter_fasta_file_.c_str());

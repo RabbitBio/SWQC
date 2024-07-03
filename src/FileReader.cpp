@@ -66,7 +66,7 @@ namespace rabbit {
             }
             for(int i = 0; i < start_line; i++) start_pos += block_sizes[i];
             for(int i = 0; i < end_line; i++) end_pos += block_sizes[i];
-            fprintf(stderr, "FileReader zip [%lld %lld] [%d %d]\n", start_pos, end_pos, start_line, end_line);
+//            fprintf(stderr, "FileReader zip [%lld %lld] [%d %d]\n", start_pos, end_pos, start_line, end_line);
             now_block = start_line;
             block_sizes.resize(end_line);
             iff_idx_end = 0;
@@ -134,7 +134,7 @@ namespace rabbit {
 #endif
             this->isZipped = true;
         } else {
-            fprintf(stderr, "start fqreader init\n");
+//            fprintf(stderr, "start fqreader init\n");
             start_pos = startPos;
             end_pos = endPos;
             if(start_pos == end_pos) {
@@ -144,7 +144,7 @@ namespace rabbit {
                 end_pos = gFile.tellg();
                 gFile.close();
             }
-            fprintf(stderr, "FileReader [%lld %lld]\n", start_pos, end_pos);
+//            fprintf(stderr, "FileReader [%lld %lld]\n", start_pos, end_pos);
             has_read = 0;
             total_read = end_pos - start_pos;
             align_end = false;
@@ -155,8 +155,11 @@ namespace rabbit {
                 exit(1);
             }
 
+#ifdef use_align_64k
             fd = open(fileName_.c_str(), O_RDWR | O_DIRECT);
-            //fd = open(fileName_.c_str(), O_RDWR);
+#else
+            fd = open(fileName_.c_str(), O_RDWR);
+#endif
             if (fd == -1) {
                 perror("Failed to open file");
                 exit(0);
@@ -184,7 +187,7 @@ namespace rabbit {
             }
 
         }
-        fprintf(stderr, "filereader init done\n");
+//        fprintf(stderr, "filereader init done\n");
     }
 
     FileReader::FileReader(int fd, bool isZipped) {
@@ -193,7 +196,7 @@ namespace rabbit {
     }
 
     FileReader::~FileReader() {
-        fprintf(stderr, "time %lf %lf, cnt %d / %d\n", t_memcpy, t_read, read_cnt_gg, read_cnt);
+//        fprintf(stderr, "time %lf %lf, cnt %d / %d\n", t_memcpy, t_read, read_cnt_gg, read_cnt);
         if (mIgInbuf != NULL) delete mIgInbuf;
         if (read_in_mem) delete[] MemData;
         if (mFile != NULL) {
@@ -309,7 +312,7 @@ namespace rabbit {
         if(offset_read + size_ > end_pos) size_ = end_pos - offset_;
         if(size_ % MY_PAGE_SIZE) {
             size_ = ((size_ / MY_PAGE_SIZE) + 1) * MY_PAGE_SIZE; 
-            fprintf(stderr, "read gg byte, -- %d\n", size_);
+//            fprintf(stderr, "read gg byte, -- %d\n", size_);
         }
 
         //fprintf(stderr, "%d == read21 byte, -- %d -- %p\n", int(t_memcpy), size_, memory_);
@@ -503,16 +506,23 @@ namespace rabbit {
 
 
                 if(has_read + size_ > total_read) size_ = total_read - has_read;
+
+#ifdef use_align_64k
                 if(size_ % MY_PAGE_SIZE) {
                     if(size_ < MY_PAGE_SIZE) size_ = ((size_ / MY_PAGE_SIZE) + 1) * MY_PAGE_SIZE; 
                     else size_ = size_ - size_ % MY_PAGE_SIZE;
                     //fprintf(stderr, "read gg byte, -- %d\n", size_);
                 }
+#endif
 
                 //fprintf(stderr, "read1 byte, -- %d -- %p\n", size_, memory_);
 
                 double t0 = GetTime();
+#ifdef use_align_64k
                 int n = read(fd, buffer_test, size_);
+#else
+                int n = read(fd, memory_, size_);
+#endif
                 t_read += GetTime() - t0;
 
                 //fprintf(stderr, "read2 %d byte, -- %d\n", n, size_);
@@ -527,7 +537,10 @@ namespace rabbit {
                 }
 
                 t0 = GetTime();
+#ifdef use_align_64k
                 memcpy(memory_, buffer_test, n);
+#else
+#endif
                 t_memcpy += GetTime() - t0;
 
                 has_read += n;

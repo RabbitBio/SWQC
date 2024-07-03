@@ -795,7 +795,7 @@ namespace rabbit {
         }
 
         void FastqFileReader::PrintTime() {
-            fprintf(stderr, "fqreader time : %lf %lf %lf\n", time0, time1, time2); 
+            fprintf(stderr, "fqreader time : %lf %lf %lf\n", time0, time1, time2);
         }
 
 
@@ -1009,33 +1009,36 @@ namespace rabbit {
             if (eof1 && eof2) eof = true;
             if (!eof) {
                 //TODO
-//                left_line_count = count_line(data, chunkEnd);
-//                right_line_count = count_line(data_right, chunkEnd_right);
-//                int64 difference = left_line_count - right_line_count;
-//                if(difference) printf("difference.......\n");
-//                if (difference > 0) {
-//                    while (chunkEnd >= 0) {
-//                        if (data[chunkEnd] == '\n') {
-//                            difference--;
-//                            if (difference == -1) {
-//                                chunkEnd++;
-//                                break;
-//                            }
-//                        }
-//                        chunkEnd--;
-//                    }
-//                } else if (difference < 0) {
-//                    while (chunkEnd_right >= 0) {
-//                        if (data_right[chunkEnd_right] == '\n') {
-//                            difference++;
-//                            if (difference == 1) {
-//                                chunkEnd_right++;
-//                                break;
-//                            }
-//                        }
-//                        chunkEnd_right--;
-//                    }
-//                }
+                if (!isZipped) {
+                    left_line_count = count_line(data, chunkEnd);
+                    right_line_count = count_line(data_right, chunkEnd_right);
+                    int64 difference = left_line_count - right_line_count;
+                    //if(difference) printf("difference.......\n");
+                    if (difference > 0) {
+                        while (chunkEnd >= 0) {
+                            if (data[chunkEnd] == '\n') {
+                                difference--;
+                                if (difference == -1) {
+                                    chunkEnd++;
+                                    break;
+                                }
+                            }
+                            chunkEnd--;
+                        }
+                    } else if (difference < 0) {
+                        while (chunkEnd_right >= 0) {
+                            if (data_right[chunkEnd_right] == '\n') {
+                                difference++;
+                                if (difference == 1) {
+                                    chunkEnd_right++;
+                                    break;
+                                }
+                            }
+                            chunkEnd_right--;
+                        }
+                    }
+                }
+
 #ifdef USE_CC_GZ
                 if(isZipped) {
                     leftPart->size = chunkEnd;

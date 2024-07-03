@@ -140,7 +140,7 @@ SeQc::SeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
             real_file_size -= (blocknum + 1) * sizeof(size_t);
             block_sizes.reserve(blocknum);
             iff_idx.seekg(-static_cast<int>((blocknum + 1) * sizeof(size_t)), ios::end);
-            fprintf(stderr, "rank%d blocknum %d\n", my_rank, blocknum);
+//            fprintf(stderr, "rank%d blocknum %d\n", my_rank, blocknum);
 
             size_t block_size = 0;
             for (size_t i = 0; i < blocknum; ++i) {
@@ -868,23 +868,23 @@ void SeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data, ve
 
 }
 
-inline void gather_and_sort_vectors_se(int rank, int comm_size, int out_round, std::vector<std::pair<int, size_t>>& local_vec, int root) {
+inline void gather_and_sort_vectors_se(int rank, int comm_size, int out_round, vector<pair<int, size_t>>& local_vec, int root) {
     int local_size = local_vec.size();
-    std::vector<int> send_data(local_size * 2);
+    vector<int> send_data(local_size * 2);
     for (int i = 0; i < local_size; ++i) {
         send_data[2 * i] = local_vec[i].first;
         send_data[2 * i + 1] = static_cast<int>(local_vec[i].second);  // Assuming size_t can be safely cast to int
     }
 
     // Root process initializes a vector to hold all received data
-    std::vector<int> recv_data;
+    vector<int> recv_data;
     if (rank == root) {
         recv_data.reserve(local_size * 2 * comm_size);  // Reserve enough space
     }
 
     // Root process receives data from all other processes
     if (rank == root) {
-        std::vector<int> buffer(local_size * 2);
+        vector<int> buffer(local_size * 2);
         for (int i = 0; i < comm_size; ++i) {
             if (i == root) {
                 // Include the root's own data
@@ -901,17 +901,17 @@ inline void gather_and_sort_vectors_se(int rank, int comm_size, int out_round, s
 
     // Root process sorts all received data
     if (rank == root) {
-        std::vector<std::pair<int, size_t>> all_data;
+        vector<pair<int, size_t>> all_data;
         for (int i = 0; i < recv_data.size() / 2; ++i) {
             all_data.emplace_back(recv_data[2 * i], static_cast<size_t>(recv_data[2 * i + 1]));
         }
-        std::sort(all_data.begin(), all_data.end());
+        sort(all_data.begin(), all_data.end());
 
         //// Print sorted data for verification
         //for (const auto& p : all_data) {
-        //    std::cout << "(" << p.first << ", " << p.second << ") ";
+        //    cout << "(" << p.first << ", " << p.second << ") ";
         //}
-        //std::cout << std::endl;
+        //cout << endl;
 
         // Optionally clear and repopulate local_vec
         local_vec.clear();
@@ -1001,7 +1001,7 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
             }
 
             {
-                std::lock_guard <std::mutex> guard(globalMutex);
+                lock_guard <mutex> guard(globalMutex);
                 __real_athread_spawn((void *) slave_decompressfunc, degz_paras, 1);
                 athread_join();
             }
@@ -1111,6 +1111,7 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
 
                 if(cmd_info_->splitWrite_) {
 
+                    
                     memcpy(this_round_align_buffer, last_round_align_buffer, last_round_align_size);
                     this_round_align_size = last_round_align_size;
 
@@ -1141,7 +1142,7 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
                     }
 
                     MPI_Get_count(&status, MPI_CHAR, &this_round_align_size_tmp);
-                    std::memcpy(this_round_align_buffer, this_round_align_buffer_tmp, this_round_align_size_tmp);
+                    memcpy(this_round_align_buffer, this_round_align_buffer_tmp, this_round_align_size_tmp);
                     this_round_align_size = this_round_align_size_tmp;
 //                  fprintf(stderr, "rank%d now has %d\n", my_rank, this_round_align_size);
 
@@ -1169,6 +1170,7 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
                     long long now2_offset = real_pre_chunk_pos;
                     real_pre_chunk_pos += writeInfos[i].buffer_len;
                     int now2_size = writeInfos[i].buffer_len - real_pre_chunk_pos % my_alignment;
+                    int tmp2_size = now2_size;
                     if(now2_size < 0) {
                         now2_size = writeInfos[i].buffer_len;
                         zero_done = true;
@@ -1179,10 +1181,15 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
                     //fprintf(stderr, "rank%d -%d- this chunk [%lld %d] - [%lld %d] - %d\n", my_rank, i, now_offset, now_size, now2_offset, now2_size, real_pre_chunk_pos % my_alignment);
 
                     if(i == 63) {
-                        memcpy(this_round_align_buffer, writeInfos[i].buffer + now2_size, real_pre_chunk_pos % my_alignment);
-                        this_round_align_size = real_pre_chunk_pos % my_alignment;
+                        if(tmp2_size < 0) {
+                            this_round_align_size = 0;
+                        } else {
+                            memcpy(this_round_align_buffer, writeInfos[i].buffer + now2_size, real_pre_chunk_pos % my_alignment);
+                            this_round_align_size = real_pre_chunk_pos % my_alignment;
+                        }
 
                     }
+
 
                     while (queueNumNow >= queueSizeLim) {
 #ifdef Verbose
@@ -1196,7 +1203,7 @@ void SeQc::ConsumerSeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
                 }
 
                 if(my_rank == comm_size - 1 || cmd_info_->splitWrite_) {
-                    std::memcpy(last_round_align_buffer, this_round_align_buffer, this_round_align_size);
+                    memcpy(last_round_align_buffer, this_round_align_buffer, this_round_align_size);
                     last_round_align_size = this_round_align_size;
                 }
 
@@ -1932,9 +1939,9 @@ void SeQc::ProcessSeFastq() {
     if (cmd_info_->seq_len_ <= 200) tmpSize = SWAP2_SIZE;
 
     if(in_is_zip_) {
-        fqFileReader = new rabbit::fq::FastqFileReader(cmd_info_->in_file_name1_, *fastqPool, "", in_is_zip_, tmpSize, start_line_, end_line_, use_in_mem);
+        fqFileReader = new rabbit::fq::FastqFileReader(cmd_info_->in_file_name1_, *fastqPool, "", in_is_zip_, tmpSize, start_line_, end_line_, 0, 0, use_in_mem);
     } else {
-        fqFileReader = new rabbit::fq::FastqFileReader(cmd_info_->in_file_name1_, *fastqPool, "", in_is_zip_, tmpSize, start_pos_, end_pos_, use_in_mem);
+        fqFileReader = new rabbit::fq::FastqFileReader(cmd_info_->in_file_name1_, *fastqPool, "", in_is_zip_, tmpSize, start_pos_, end_pos_, 0, 0,use_in_mem);
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -1987,7 +1994,7 @@ void SeQc::ProcessSeFastq() {
 
     MPI_Barrier(MPI_COMM_WORLD);
 
-    fqFileReader->PrintTime(); 
+//    fqFileReader->PrintTime();
 
     printf("all pro write done2\n");
     printf("TOT TIME1 %lf\n", GetTime() - ttt);
@@ -2237,20 +2244,10 @@ void SeQc::ProducerSeFastqTask(string file, rabbit::fq::FastqDataPool *fastq_dat
         double t_sum1 = 0;
         double t_sum2 = 0;
         double t_sum3 = 0;
-        bool is_first = 1;
         int64_t tot_size = 0;
         while (true) {
             double tt0 = GetTime();
             rabbit::fq::FastqDataChunk *fqdatachunk;
-            int64_t offset;
-            if(is_first) {
-                offset = 0;
-                for(int i = 0; i < my_rank; i++)
-                    offset += part_sizes[i];
-            } else {
-                offset = -1;
-            }
-            is_first = 0;
             fqdatachunk = fqFileReader->readNextChunk();
             t_sum1 += GetTime() - tt0;
             tt0 = GetTime();

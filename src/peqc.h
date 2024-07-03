@@ -120,10 +120,15 @@ private:
     std::ofstream off_idx2;
     bool in_is_zip_;
     bool out_is_zip_;
+
     int start_line_;
     int end_line_;
+    int start_line2_;
+    int end_line2_;
     int64_t start_pos_;
     int64_t end_pos_;
+    int64_t start_pos2_;
+    int64_t end_pos2_;
 
     moodycamel::ReaderWriterQueue<std::pair<char *, int>> *
             pugzQueue1;
@@ -175,7 +180,6 @@ private:
     std::mutex p_mylock;
     bool use_align_write;
 
-    int64_t *part_sizes;
     std::vector<std::pair<int, size_t>> out_gz_block_sizes1;
     std::vector<std::pair<int, size_t>> out_gz_block_sizes2;
 

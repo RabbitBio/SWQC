@@ -73,7 +73,7 @@ namespace rabbit {
             }
 
             ~TDataPool() {
-                fprintf(stderr, "~TDataPool time : %lf %lf\n", time_pool_0, time_pool_1);
+//                fprintf(stderr, "~TDataPool time : %lf %lf\n", time_pool_0, time_pool_1);
                 //for (typename part_pool::iterator i = allocatedPartsPool.begin(); i != allocatedPartsPool.end(); ++i) {
                 //    ASSERT(*i != NULL);
                 //    delete *i;

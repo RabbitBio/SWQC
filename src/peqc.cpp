@@ -77,68 +77,19 @@ char* OutMemData1;
 char* OutMemData2;
 
 
-
-/**
- * @brief Construct function
- * @param cmd_info1 : cmd information
- */
-PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
-    my_rank = my_rank_;
-    comm_size = comm_size_;
-    part_sizes = new int64_t[comm_size];
-    now_pos1_ = 0;
-    now_pos2_ = 0;
-    zip_now_pos1_ = 0;
-    zip_now_pos2_ = 0;
-    cmd_info_ = cmd_info1;
-    filter_ = new Filter(cmd_info1);
-    done_thread_number_ = 0;
-    int out_block_nums = int(1.0 * cmd_info1->in_file_size1_ / cmd_info1->out_block_size_);
-    out_queue_ = NULL;
-    align_out_queue_ = NULL;
-    p_out_queue_ = NULL;
-    //out_queue1_ = NULL;
-    //out_queue2_ = NULL;
-    in_is_zip_ = cmd_info1->in_file_name1_.find(".gz") != string::npos;
-    out_is_zip_ = cmd_info1->out_file_name1_.find(".gz") != string::npos;
-
-    if(in_is_zip_ && comm_size > 1) {
-#ifdef USE_LIBDEFLATE
-#else
-        if(my_rank == 0) fprintf(stderr, "compress file input for multi-process is not support, please use -DUSE_LIBDEFLATE in makefile.\n");
-        exit(0);
-#endif
-    }
-
-
+void getStartEndPos(string name_file, int64_t &start_pos_, int64_t &end_pos_, int &start_line_, int &end_line_, int my_rank, int comm_size, bool in_is_zip_) {
     ifstream gFile;
-    gFile.open(cmd_info1->in_file_name1_.c_str());
+    gFile.open(name_file.c_str());
     gFile.seekg(0, ios_base::end);
     long long real_file_size = gFile.tellg();
     gFile.close();
 
-    gFile.open(cmd_info1->in_file_name2_.c_str());
-    gFile.seekg(0, ios_base::end);
-    long long real_file_size2 = gFile.tellg();
-    gFile.close();
-
-    if(!in_is_zip_ && real_file_size != real_file_size2 && comm_size > 1) {
-        fprintf(stderr, "PE in files size error %lld %lld\n", real_file_size, real_file_size2);
-        exit(0);
-    }
-
-
     int64_t start_pos, end_pos;
     if(in_is_zip_) {
-#ifdef USE_CC_GZ
-        for(int i = 0; i < 64; i++) {
-            cc_gz_in_buffer[i] = new char[BLOCK_SIZE];
-        }
-#endif
         vector<size_t> block_sizes;
         if(use_swidx_file) {
             ifstream iff_idx;
-            iff_idx.open(cmd_info1->in_file_name1_ + ".swidx");
+            iff_idx.open(name_file + ".swidx");
             size_t block_size = 0;
             while (iff_idx >> block_size) {
                 block_sizes.push_back(block_size);
@@ -146,7 +97,7 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
             iff_idx.close();
         } else {
             ifstream iff_idx;
-            iff_idx.open(cmd_info1->in_file_name1_, ios::binary | ios::ate);
+            iff_idx.open(name_file, ios::binary | ios::ate);
             if (!iff_idx.is_open()) {
                 cerr << "Failed to open file!" << endl;
                 exit(0);
@@ -159,7 +110,7 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
             real_file_size -= (blocknum + 1) * sizeof(size_t);
             block_sizes.reserve(blocknum);
             iff_idx.seekg(-static_cast<int>((blocknum + 1) * sizeof(size_t)), ios::end);
-            fprintf(stderr, "rank%d blocknum %d\n", my_rank, blocknum);
+//            fprintf(stderr, "rank%d blocknum %d\n", my_rank, blocknum);
 
             size_t block_size = 0;
             for (size_t i = 0; i < blocknum; ++i) {
@@ -193,24 +144,19 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
         if(end_pos > real_file_size) end_pos = real_file_size;
     }
 
-
-    if(in_is_zip_) {
-        fprintf(stderr, "rank%d line: [%d %d]\n", my_rank, start_line_, end_line_);
-    }
-
-
     int64_t right_pos;
     if(in_is_zip_) {
         right_pos = 0;
     } else {
         FILE *pre_fp;
-        pre_fp = fopen(cmd_info1->in_file_name1_.c_str(), "rb");
+        pre_fp = fopen(name_file.c_str(), "rb");
         fseek(pre_fp, start_pos, SEEK_SET);
         char *tmp_chunk = new char[1 << 20];
         int res_size = fread(tmp_chunk, sizeof(char), 1 << 20, pre_fp);
         if(my_rank == 0) right_pos = 0;
         else right_pos = GetNextFastq(tmp_chunk, 0, res_size);
         fclose(pre_fp);
+        delete[] tmp_chunk;
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -222,7 +168,7 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
     } else {
         for(int ii = 1; ii < comm_size; ii++) {
             MPI_Recv(&(now_poss[ii]), 1, MPI_LONG, ii, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        } 
+        }
     }
     MPI_Barrier(MPI_COMM_WORLD);
     if(my_rank == 0) {
@@ -233,15 +179,259 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
         MPI_Recv(now_poss, comm_size, MPI_LONG, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     }
     MPI_Barrier(MPI_COMM_WORLD);
-    for(int i = 0; i < comm_size; i++) {
-        if(i == comm_size - 1) part_sizes[i] = real_file_size - now_poss[i];
-        else part_sizes[i] = now_poss[i + 1] - now_poss[i];
-    }
 
     start_pos_ = now_poss[my_rank];
     if(my_rank == 0 && start_pos_ != 0) fprintf(stderr, "GG size division\n");
     if(my_rank == comm_size - 1) end_pos_ = real_file_size;
     else end_pos_ = now_poss[my_rank + 1];
+}
+
+Reference getNextFASTQItem(char* &data, int &length) {
+    Reference ref;
+    string input(data, length);
+    size_t pos = 0;
+    size_t nextPos;
+
+    // Extract name and comment
+    if ((nextPos = input.find('\n', pos)) != string::npos) {
+        string header = input.substr(pos, nextPos - pos);
+        pos = nextPos + 1;
+
+        size_t spacePos = header.find(' ');
+        if (spacePos != string::npos) {
+            ref.name = header.substr(1, spacePos - 1); // Remove '@'
+            ref.comment = header.substr(spacePos + 1);
+        } else {
+            ref.name = header.substr(1); // Remove '@'
+            ref.comment = "";
+        }
+    } else {
+        throw runtime_error("Invalid FASTQ format: Missing header line");
+    }
+
+    // Extract sequence
+    if ((nextPos = input.find('\n', pos)) != string::npos) {
+        ref.seq = input.substr(pos, nextPos - pos);
+        pos = nextPos + 1;
+    } else {
+        throw runtime_error("Invalid FASTQ format: Missing sequence line");
+    }
+
+    // Skip strand identifier line
+    if ((nextPos = input.find('\n', pos)) != string::npos) {
+        ref.strand = input.substr(pos, nextPos - pos);
+        pos = nextPos + 1;
+    } else {
+        throw runtime_error("Invalid FASTQ format: Missing strand line");
+    }
+
+    // Extract quality
+    if ((nextPos = input.find('\n', pos)) != string::npos) {
+        ref.quality = input.substr(pos, nextPos - pos);
+        pos = nextPos + 1;
+    } else {
+        throw runtime_error("Invalid FASTQ format: Missing quality line");
+    }
+
+    // Set the length and gid
+    ref.length = ref.seq.length();
+    ref.gid = 0; // Assuming gid needs to be set externally or needs additional logic
+
+    size_t itemSize = pos;
+    data += itemSize;
+    length -= itemSize;
+
+    return ref;
+}
+
+void PrintFASTQItem(Reference ref) {
+    fprintf(stderr, "%s\n", ref.name.c_str());
+    fprintf(stderr, "%s\n", ref.comment.c_str());
+    fprintf(stderr, "%s\n", ref.seq.c_str());
+    fprintf(stderr, "%s\n", ref.quality.c_str());
+    fprintf(stderr, "%s\n", ref.strand.c_str());
+}
+
+int CalFASTQItemSize(Reference ref) {
+    return ref.name.size() + 1 + ref.comment.size() + ref.seq.size() + ref.strand.size() + ref.quality.size() + 4;
+}
+
+void PrintFromFile(string name_file1, string name_file2, int64_t start_pos, int64_t end_pos, int64_t start_pos2, int64_t end_pos2, int my_rank, int comm_size) {
+    FILE *fp1;
+    FILE *fp2;
+    fp1 = fopen(name_file1.c_str(), "rb");
+    fp2 = fopen(name_file1.c_str(), "rb");
+    fseek(fp1, start_pos, SEEK_SET);
+    fseek(fp2, start_pos2, SEEK_SET);
+    char *tmp_chunk1 = new char[1 << 20];
+    char *tmp_chunk2 = new char[1 << 20];
+    int res_size1 = fread(tmp_chunk1, sizeof(char), 1 << 20, fp1);
+    int res_size2 = fread(tmp_chunk2, sizeof(char), 1 << 20, fp2);
+
+    Reference r1 = getNextFASTQItem(tmp_chunk1, res_size1);
+    Reference r2 = getNextFASTQItem(tmp_chunk2, res_size2);
+
+    fprintf(stderr, "rank%d print PE files:   [ %s ] == [ %s ]\n", my_rank, r1.name.c_str(), r2.name.c_str());
+
+    fclose(fp1);
+    fclose(fp2);
+    delete[] tmp_chunk1;
+    delete[] tmp_chunk2;
+}
+
+void adjustPos(string name_file1, string name_file2, int64_t start_pos, int64_t end_pos, int64_t start_pos2, int64_t end_pos2, int my_rank, int comm_size) {
+    FILE *fp1;
+    FILE *fp2;
+    fp1 = fopen(name_file1.c_str(), "rb");
+    fp2 = fopen(name_file1.c_str(), "rb");
+    fseek(fp1, start_pos, SEEK_SET);
+    fseek(fp2, start_pos2, SEEK_SET);
+    char *tmp_chunk1 = new char[1 << 20];
+    char *tmp_chunk2 = new char[1 << 20];
+    int res_size1 = fread(tmp_chunk1, sizeof(char), 1 << 20, fp1);
+    int res_size2 = fread(tmp_chunk2, sizeof(char), 1 << 20, fp2);
+
+    Reference r1 = getNextFASTQItem(tmp_chunk1, res_size1);
+    Reference r2 = getNextFASTQItem(tmp_chunk2, res_size2);
+
+    long r1_id = stoi(r1.comment.substr(0, r1.comment.find(' ')));
+    long r2_id = stoi(r2.comment.substr(0, r2.comment.find(' ')));
+
+
+
+
+    if(r1_id < r2_id) {
+        while(r1_id < r2_id) {
+            start_pos += CalFASTQItemSize(r1);
+            r1 = getNextFASTQItem(tmp_chunk1, res_size1);
+            r1_id = stoi(r1.comment.substr(0, r1.comment.find(' ')));
+        }
+        fprintf(stderr, "move R1 pointer, now is %lld %lld\n", r1_id, r2_id);
+    } else if(r1_id > r2_id) {
+        while(r1_id > r2_id) {
+            start_pos2 += CalFASTQItemSize(r2);
+            r2 = getNextFASTQItem(tmp_chunk2, res_size2);
+            r2_id = stoi(r2.comment.substr(0, r2.comment.find(' ')));
+        }
+        fprintf(stderr, "move R2 pointer, now is %lld %lld\n", r1_id, r2_id);
+    } else {
+        fprintf(stderr, "now equal %lld %lld\n", r1_id, r2_id);
+    }
+
+
+    int64_t now_pos = start_pos;
+    int64_t now_poss[comm_size];
+    now_poss[0] = now_pos;
+    if(my_rank) {
+        MPI_Send(&now_pos, 1, MPI_LONG, 0, 0, MPI_COMM_WORLD);
+    } else {
+        for(int ii = 1; ii < comm_size; ii++) {
+            MPI_Recv(&(now_poss[ii]), 1, MPI_LONG, ii, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    if(my_rank == 0) {
+        for(int ii = 1; ii < comm_size; ii++) {
+            MPI_Send(now_poss, comm_size, MPI_LONG, ii, 0, MPI_COMM_WORLD);
+        }
+    } else {
+        MPI_Recv(now_poss, comm_size, MPI_LONG, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    assert(now_poss[my_rank] == start_pos);
+
+    if(my_rank < comm_size - 1 && end_pos != now_poss[my_rank + 1]) {
+        fprintf(stderr, "rank%d change end pos from %lld to %lld\n", end_pos, now_poss[my_rank + 1]);
+        end_pos = now_poss[my_rank + 1];
+    }
+
+
+
+    fclose(fp1);
+    fclose(fp2);
+    delete[] tmp_chunk1;
+    delete[] tmp_chunk2;
+}
+
+
+/**
+ * @brief Construct function
+ * @param cmd_info1 : cmd information
+ */
+PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
+    my_rank = my_rank_;
+    comm_size = comm_size_;
+    now_pos1_ = 0;
+    now_pos2_ = 0;
+    zip_now_pos1_ = 0;
+    zip_now_pos2_ = 0;
+    cmd_info_ = cmd_info1;
+    filter_ = new Filter(cmd_info1);
+    done_thread_number_ = 0;
+    int out_block_nums = int(1.0 * cmd_info1->in_file_size1_ / cmd_info1->out_block_size_);
+    out_queue_ = NULL;
+    align_out_queue_ = NULL;
+    p_out_queue_ = NULL;
+    //out_queue1_ = NULL;
+    //out_queue2_ = NULL;
+    in_is_zip_ = cmd_info1->in_file_name1_.find(".gz") != string::npos;
+    out_is_zip_ = cmd_info1->out_file_name1_.find(".gz") != string::npos;
+
+    if(in_is_zip_ && comm_size > 1) {
+#ifdef USE_LIBDEFLATE
+#else
+        if(my_rank == 0) fprintf(stderr, "compress file input for multi-process is not support, please use -DUSE_LIBDEFLATE in makefile.\n");
+        exit(0);
+#endif
+    }
+
+    if(in_is_zip_) {
+#ifdef USE_CC_GZ
+        for (int i = 0; i < 64; i++) {
+            cc_gz_in_buffer[i] = new char[BLOCK_SIZE];
+        }
+#endif
+    }
+
+    ifstream gFile1;
+    gFile1.open(cmd_info1->in_file_name1_.c_str());
+    gFile1.seekg(0, ios_base::end);
+    long long real_file_size1 = gFile1.tellg();
+    gFile1.close();
+
+    ifstream gFile2;
+    gFile2.open(cmd_info1->in_file_name2_.c_str());
+    gFile2.seekg(0, ios_base::end);
+    long long real_file_size2 = gFile2.tellg();
+    gFile2.close();
+
+#ifdef use_align_64k
+    if(real_file_size1 != real_file_size2) {
+        fprintf(stderr, "Only unalign input mode supports PE reads with mismatched lengths. You can comment the use_align_64k in src/globalMutex.h to enable unalign input mode.\n");
+        exit(0); 
+    }
+#endif
+
+
+    getStartEndPos(cmd_info1->in_file_name1_, start_pos_, end_pos_, start_line_, end_line_, my_rank, comm_size, in_is_zip_);
+    getStartEndPos(cmd_info1->in_file_name2_, start_pos2_, end_pos2_, start_line2_, end_line2_, my_rank, comm_size, in_is_zip_);
+
+
+    fprintf(stderr, "rank%d, file1 [%lld %lld], [%d %d]\n", my_rank, start_pos_, end_pos_, start_line_, end_line_);
+    fprintf(stderr, "rank%d, file2 [%lld %lld], [%d %d]\n", my_rank, start_pos2_, end_pos2_, start_line2_, end_line2_);
+
+    if(!in_is_zip_ && real_file_size1 != real_file_size2) {
+
+
+        PrintFromFile(cmd_info1->in_file_name1_, cmd_info1->in_file_name2_, start_pos_, end_pos_, start_pos2_, end_pos2_, my_rank, comm_size);
+
+        adjustPos(cmd_info1->in_file_name1_, cmd_info1->in_file_name2_, start_pos_, end_pos_, start_pos2_, end_pos2_, my_rank, comm_size);
+
+        PrintFromFile(cmd_info1->in_file_name1_, cmd_info1->in_file_name2_, start_pos_, end_pos_, start_pos2_, end_pos2_, my_rank, comm_size);
+
+    }
+
 
     p_out_queue_ = new vector<rabbit::fq::FastqDataPairChunk *>[1 << 20];
     p_queueP1 = 0;
@@ -509,7 +699,6 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
 
 
 PeQc::~PeQc() {
-    delete[] part_sizes;
     delete filter_;
     delete[] p_out_queue_;
     if (cmd_info_->write_data_) {
@@ -530,6 +719,8 @@ PeQc::~PeQc() {
         delete umier_;
     }
 }
+
+
 
 
 string PeQc::Read2String(neoReference &ref) {
@@ -566,21 +757,11 @@ void PeQc::ProducerPeFastqTask64(string file, string file2, rabbit::fq::FastqDat
 
     double t_sum1 = 0;
     double t_sum2 = 0;
-    bool is_first = 1;
     int64_t tot_size = 0;
     vector<rabbit::fq::FastqDataPairChunk *> tmp_chunks;
     while (true) {
         double tt0 = GetTime();
         rabbit::fq::FastqDataPairChunk *fqdatachunk;
-        int64_t offset;
-        if(is_first) {
-            offset = 0;
-            for(int i = 0; i < my_rank; i++)
-                offset += part_sizes[i];
-        } else {
-            offset = -1;
-        }
-        is_first = 0;
 #ifdef use_align_64k
         if(in_is_zip_) fqdatachunk = fqFileReader->readNextPairChunk();
         else fqdatachunk = fqFileReader->readNextPairChunkAlign();
@@ -611,6 +792,38 @@ void PeQc::ProducerPeFastqTask64(string file, string file2, rabbit::fq::FastqDat
             p_queueNumNow++;
             break;
         }
+        
+        //fprintf(stderr, "== %d ,chunk size %lld %lld\n", tmp_chunks.size(), fqdatachunk->left_part->size, fqdatachunk->right_part->size);
+#ifdef use_align_64k
+#else
+        if(fqdatachunk->left_part->data.offset_align != 0) fprintf(stderr, "offset align != 0, %lld\n", fqdatachunk->left_part->data.offset_align);
+        if(fqdatachunk->right_part->data.offset_align != 0) fprintf(stderr, "offset align != 0, %lld\n", fqdatachunk->right_part->data.offset_align);
+#endif
+
+        //if(fqdatachunk->left_part->size > 200) {
+        //    size_t data_size = fqdatachunk->left_part->size;
+        //    char * tmp_p = (char*)fqdatachunk->left_part->data.PointerAlign();
+        //    if(tmp_p[0] != '@') {
+        //    //if(1){
+        //        fprintf(stderr, "GG not @, %c\n", tmp_p[0]);
+        //        for(int i = 0; i < 200; i++) {
+        //            fprintf(stderr, "%c", tmp_p[i]);
+        //        }	
+        //        fprintf(stderr, "\n\n");
+        //    }
+        //    size_t start_index = (data_size > 200) ? data_size - 200 : 0;
+        //    tmp_p = (char*)fqdatachunk->left_part->data.Pointer();
+        //    if(tmp_p[start_index + 99] != '\n') {
+        //    //if(1){
+        //        fprintf(stderr, "GG not enter, %c\n", tmp_p[start_index + 99]);
+        //        for(int i = start_index; i < start_index + 200; i++) {
+        //            fprintf(stderr, "%c", tmp_p[i]);
+        //        }	
+        //        fprintf(stderr, "\n\n");
+        //    }
+        //    fprintf(stderr, "\n\n");
+		//}
+
         tot_size += fqdatachunk->left_part->size - fqdatachunk->left_part->data.offset_align + 1;
         tmp_chunks.push_back(fqdatachunk);
 //        fprintf(stderr, "producer %d read a chunk\n", my_rank);
@@ -651,8 +864,8 @@ struct PeMerge_data {
     char* out_data2[64];
     int out_lens1[64] = {0};
     int out_lens2[64] = {0};
-    std::vector <neoReference> *pass_data1[64];
-    std::vector <neoReference> *pass_data2[64];
+    vector <neoReference> *pass_data1[64];
+    vector <neoReference> *pass_data2[64];
     int pass_data_size1[64];
     int pass_data_size2[64];
 };
@@ -773,10 +986,12 @@ void PeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data1, v
     pe_all_data.para3 = &pe_merge_data;
     tsum2 += GetTime() - tt0;
 
+
     tt0 = GetTime();
     __real_athread_spawn((void *)slave_peallfunc, &pe_all_data, 1);
     athread_join();
     tsum3 += GetTime() - tt0;
+
 
 
     tt0 = GetTime();
@@ -1360,11 +1575,11 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
                     }
 
                     MPI_Get_count(&status1, MPI_CHAR, &this_round_align_size_tmp1);
-                    std::memcpy(this_round_align_buffer1, this_round_align_buffer_tmp1, this_round_align_size_tmp1);
+                    memcpy(this_round_align_buffer1, this_round_align_buffer_tmp1, this_round_align_size_tmp1);
                     this_round_align_size1 = this_round_align_size_tmp1;
 
                     MPI_Get_count(&status2, MPI_CHAR, &this_round_align_size_tmp2);
-                    std::memcpy(this_round_align_buffer2, this_round_align_buffer_tmp2, this_round_align_size_tmp2);
+                    memcpy(this_round_align_buffer2, this_round_align_buffer_tmp2, this_round_align_size_tmp2);
                     this_round_align_size2 = this_round_align_size_tmp2;
 //                  fprintf(stderr, "rank%d now has %d\n", my_rank, this_round_align_size);
 
@@ -1432,8 +1647,8 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
                 }
 
                 if(my_rank == comm_size - 1 || cmd_info_->splitWrite_) {
-                    std::memcpy(last_round_align_buffer1, this_round_align_buffer1, this_round_align_size1);
-                    std::memcpy(last_round_align_buffer2, this_round_align_buffer2, this_round_align_size2);
+                    memcpy(last_round_align_buffer1, this_round_align_buffer1, this_round_align_size1);
+                    memcpy(last_round_align_buffer2, this_round_align_buffer2, this_round_align_size2);
                     last_round_align_size1 = this_round_align_size1;
                     last_round_align_size2 = this_round_align_size2;
                 }
@@ -2645,9 +2860,9 @@ void PeQc::ProcessPeFastq() {
     if (cmd_info_->seq_len_ <= 200) tmpSize = SWAP2_SIZE;
     
     if(in_is_zip_) {
-        fqFileReader = new rabbit::fq::FastqFileReader(cmd_info_->in_file_name1_, *fastqPool, cmd_info_->in_file_name2_, in_is_zip_, tmpSize, start_line_, end_line_, use_in_mem);
+        fqFileReader = new rabbit::fq::FastqFileReader(cmd_info_->in_file_name1_, *fastqPool, cmd_info_->in_file_name2_, in_is_zip_, tmpSize, start_line_, end_line_, start_line2_, end_line2_, use_in_mem);
     } else {
-        fqFileReader = new rabbit::fq::FastqFileReader(cmd_info_->in_file_name1_, *fastqPool, cmd_info_->in_file_name2_, in_is_zip_, tmpSize, start_pos_, end_pos_, use_in_mem);
+        fqFileReader = new rabbit::fq::FastqFileReader(cmd_info_->in_file_name1_, *fastqPool, cmd_info_->in_file_name2_, in_is_zip_, tmpSize, start_pos_, end_pos_, start_pos2_, end_pos2_, use_in_mem);
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -2685,7 +2900,7 @@ void PeQc::ProcessPeFastq() {
     MPI_Barrier(MPI_COMM_WORLD);
     printf("rank%d all pro done2\n", my_rank);
 
-    fqFileReader->PrintTime();
+//    fqFileReader->PrintTime();
     
 
 #ifdef Verbose
