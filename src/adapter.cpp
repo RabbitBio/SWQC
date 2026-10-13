@@ -1,4 +1,5 @@
 #include "adapter.h"
+#include "gzip_pipeline.h"
 
 #define mod 9999991
 
@@ -147,7 +148,7 @@ void Adapter::PreOverAnalyze(string file_name, vector<string> &hot_seqs, int &ev
     auto *fastq_data_pool = new rabbit::fq::FastqDataPool(4, 1 << 22);
     auto fqFileReader = new rabbit::fq::FastqFileReader(file_name, *fastq_data_pool, "",
             file_name.find(".gz") != string::npos);
-    bool isZipped = file_name.find(".gz") != string::npos;
+    bool isZipped = !swqc_standard_gzip() && file_name.find(".gz") != string::npos;
     int64_t n_chunks = 0;
     const long BASE_LIMIT = 151 * 10000;
     long records = 0;
@@ -389,7 +390,7 @@ int Adapter::EvalMaxLen(string file_name) {
     auto *fastq_data_pool = new rabbit::fq::FastqDataPool(4, 1 << 22);
     auto fqFileReader = new rabbit::fq::FastqFileReader(file_name, *fastq_data_pool, "",
             file_name.find(".gz") != string::npos);
-    bool isZipped = file_name.find(".gz") != string::npos;
+    bool isZipped = !swqc_standard_gzip() && file_name.find(".gz") != string::npos;
     int64_t n_chunks = 0;
     // stat up to 256K reads
     const long READ_LIMIT = 4 * 1024;

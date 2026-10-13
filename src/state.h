@@ -84,7 +84,7 @@ public:
 
     int GetKmerBufLen() const;
 
-    int *GetPosQul() const;
+    int64_t *GetPosQul() const;
 
     int *GetPosCnt() const;
 
@@ -140,7 +140,7 @@ public:
     int qul_range_;
     int real_seq_len_;
     int kmer_buf_len_;
-    int *pos_qul_;
+    int64_t *pos_qul_;
     int *pos_cnt_;
     int *len_cnt_;
     int *gc_cnt_;

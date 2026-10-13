@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <iostream>
 #include <vector>
+#include <unordered_set>
 
 #ifdef USE_BOOST_THREAD
 #include <boost/thread.hpp>
@@ -46,9 +47,10 @@ namespace rabbit {
 
             part_pool availablePartsPool;
             part_pool allocatedPartsPool;
+            std::unordered_set<const DataType *> allocatedPartsIndex;
 
-            //th::mutex mutex;
-            //th::condition_variable partsAvailableCondition;
+            th::mutex mutex;
+            th::condition_variable partsAvailableCondition;
 
         public:
             volatile uint32 partNum;
@@ -64,6 +66,7 @@ namespace rabbit {
                 : maxPartNum(maxPartNum_), bufferPartSize(bufferPartSize_), partNum(0) {
                 availablePartsPool.resize(maxPartNum);
                 allocatedPartsPool.reserve(maxPartNum);
+                allocatedPartsIndex.reserve(maxPartNum);
             }
 
             ~TDataPool() {
@@ -80,18 +83,19 @@ namespace rabbit {
              * @param part_ the pointer to acquireed space
              */
             void Acquire(DataType *&part_) {
-                //th::unique_lock<th::mutex> lock(mutex);
+                th::unique_lock<th::mutex> lock(mutex);
 
                 while (partNum >= maxPartNum) {
-                    //partsAvailableCondition.wait(lock);
+                    partsAvailableCondition.wait(lock);
                 }
                 ASSERT(availablePartsPool.size() > 0);
 
-                DataType *&pp = availablePartsPool.back();
+                DataType *pp = availablePartsPool.back();
                 availablePartsPool.pop_back();
                 if (pp == NULL) {
                     pp = new DataType(bufferPartSize);
                     allocatedPartsPool.push_back(pp);
+                    allocatedPartsIndex.insert(pp);
                 } else {
                     pp->Reset();
                 }
@@ -106,16 +110,24 @@ namespace rabbit {
              * @param part_ the pointer to be realesed to DataPool
              */
             void Release(const DataType *part_) {
-                //th::lock_guard<th::mutex> lock(mutex);
+                ReleaseBatch(&part_, 1);
+            }
 
-                ASSERT(part_ != NULL);
-                ASSERT(partNum != 0 && partNum <= maxPartNum);
-                ASSERT(std::find(allocatedPartsPool.begin(), allocatedPartsPool.end(), part_) !=
-                       allocatedPartsPool.end());
-                availablePartsPool.push_back((DataType *) part_);
-                partNum--;
-
-                //partsAvailableCondition.notify_one();
+            void ReleaseBatch(const DataType *const *parts, size_t count) {
+                if (!count) return;
+                {
+                    th::lock_guard<th::mutex> lock(mutex);
+                    ASSERT(count <= partNum && partNum <= maxPartNum);
+                    for (size_t i = 0; i < count; ++i) {
+                        ASSERT(parts[i] != NULL && allocatedPartsIndex.count(parts[i]) != 0);
+                        ((DataType *)parts[i])->Reset();
+                        availablePartsPool.push_back((DataType *)parts[i]);
+                    }
+                    partNum -= count;
+                }
+                // Publish the whole completed batch before waking blocked readers.
+                if (count == 1) partsAvailableCondition.notify_one();
+                else partsAvailableCondition.notify_all();
             }
         };
 

@@ -1,0 +1,34 @@
+Third-party codec source notices
+
+rapidgzip / librapidarchive
+--------------------------
+The minimal header subset in rapidgzip/ originates from
+https://github.com/mxmlnkn/indexed_bzip2 at revision
+1221a30bb548b305a69e5715f2bc348ba37ac243, used by rapidgzip.
+Upstream MIT and Apache license texts are retained in that directory.
+
+SWQC adaptations are not upstream behavior claims:
+- Replace host file/thread plumbing with a concrete CPE memory reader and
+  direct offset dispatch for relocated CPE text.
+- Avoid exception-based normal buffer refill and reject reserved distance
+  codes through the decoder status path.
+- Adapt diagnostic and constexpr helpers for the Sunway C++ toolchain.
+- Bound the stored-block finder's look-behind at input interval boundaries.
+- Optionally separate large window/lookup arrays from the hot decoder state
+  for LDM placement, without changing DEFLATE semantics.
+
+The first-pass scheduler, runtime integration, buffer leases and CPE wrappers
+outside this vendor directory are SWQC code, not the upstream parallel reader.
+
+zlib
+----
+The compressor subset in zlib/ originates from https://github.com/madler/zlib
+at revision 767c4c947852e143f582c85f14cf573411df1b35.
+The upstream license text and source copyright notices are retained.
+Local alteration: deflate.c selects the original level/strategy compressor
+through equivalent direct calls instead of an immutable function-pointer table,
+so calls remain valid after CPE text relocation. Unused inflate implementation
+files are omitted; the MPE uses system zlib for the serial decoder/fallback.
+
+Compression follows pigz's ordered raw-DEFLATE fragment composition with a
+preceding 32 KiB dictionary. It uses zlib CPE jobs, not pigz's POSIX worker pool.

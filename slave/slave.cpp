@@ -11,6 +11,7 @@ extern "C"
 #include "FastxChunk.h"
 #include "Globals.h"
 #include "Reference.h"
+#include "swqc_fastq_record.h"
 #include "cmdinfo.h"
 #include "state.h"
 #include "tgsstate.h"
@@ -21,13 +22,20 @@ extern "C"
 #define gcMax 100
 #define LOCALSIZE 2 * (1 << 10)
 #define BATCH_SIZE 2
+#if SWQC_MANUAL_LDM
 __thread_local unsigned char local_data1[LOCALSIZE];
 __thread_local unsigned char local_data2[LOCALSIZE];
+#endif
 __thread_local static int call_times = 0;
 #define tot_orp_bf_size ((1 << MODB) / 64) // 2^14
 #define pre_orp_bf_size (tot_orp_bf_size / 64) // 2^8
 #define orp_shift (8)
+#if SWQC_MANUAL_LDM
 __thread_local_fix int64_t slave_bf_zone[pre_orp_bf_size] __attribute__ ((aligned(4))); // 256 * 8B = 2KB
+#else
+static int64_t heap_bf_zone[SWQC_CPE_COUNT][pre_orp_bf_size];
+#define slave_bf_zone heap_bf_zone[_MYID]
+#endif
 
 
 
@@ -58,14 +66,14 @@ struct qc_data {
     CmdInfo *cmd_info_;
     Duplicate *duplicate_;
     //std::vector<dupInfo> *dups;
-    int data1_size[64];
-    int data2_size[64];
-    int pass_data1_size[64];
-    int pass_data2_size[64];
-    std::vector<neoReference> *data1_[64];
-    std::vector<neoReference> *data2_[64];
-    std::vector<neoReference> *pass_data1_[64];
-    std::vector<neoReference> *pass_data2_[64];
+    int data1_size[SWQC_CPE_COUNT];
+    int data2_size[SWQC_CPE_COUNT];
+    int pass_data1_size[SWQC_CPE_COUNT];
+    int pass_data2_size[SWQC_CPE_COUNT];
+    std::vector<neoReference> *data1_[SWQC_CPE_COUNT];
+    std::vector<neoReference> *data2_[SWQC_CPE_COUNT];
+    std::vector<neoReference> *pass_data1_[SWQC_CPE_COUNT];
+    std::vector<neoReference> *pass_data2_[SWQC_CPE_COUNT];
     int *cnt;
     int bit_len;
 };
@@ -96,9 +104,32 @@ void rtc_(unsigned long *counter){
 
 }
 
+static inline unsigned long swqc_kernel_clock() {
+    unsigned long ticks;
+    asm volatile("rcsr %0, 4" : "=r"(ticks) :: "memory");
+    return ticks;
+}
+
 
 extern "C" void* ldm_malloc(size_t size);
 extern "C" void ldm_free(void *addr, size_t size);
+#include "swqc_runtime.h"
+#if SWQC_LDM_POOL || !SWQC_MANUAL_LDM
+#define ldm_malloc(bytes) swqc_scratch_alloc(bytes)
+#define ldm_free(ptr, bytes) swqc_scratch_free(ptr, bytes)
+#endif
+
+#if !SWQC_MANUAL_LDM
+class SwqcReadScratch {
+    unsigned char *data_;
+public:
+    SwqcReadScratch() : data_(static_cast<unsigned char *>(swqc_scratch_alloc(LOCALSIZE))) {}
+    ~SwqcReadScratch() { swqc_scratch_free(data_, LOCALSIZE); }
+    unsigned char *data() { return data_; }
+    SwqcReadScratch(const SwqcReadScratch &) = delete;
+    SwqcReadScratch &operator=(const SwqcReadScratch &) = delete;
+};
+#endif
 
 
 
@@ -126,7 +157,7 @@ void updateTop5(int rlen, double avgQual, TGSStats *tgs_state) {
 
 extern "C" void tgsfunc(qc_data_tgs *para) {
     std::vector <neoReference> *data = para->data1_;
-    ThreadInfo *thread_info = para->thread_info_[_PEN];
+    ThreadInfo *thread_info = para->thread_info_[_MYID];
     CmdInfo *cmd_info_ = para->cmd_info_;
     int data_num = data->size();
     int base_num = 0;
@@ -150,7 +181,7 @@ extern "C" void tgsfunc(qc_data_tgs *para) {
     mBases51015Num[1] = thread_info->TGS_state_->mBases51015Num[1];
     mBases51015Num[2] = thread_info->TGS_state_->mBases51015Num[2];
     int isPhred64_ = cmd_info_->isPhred64_;
-    for(int id = _PEN * BATCH_SIZE; id < data_num; id += 64 * BATCH_SIZE) {
+    for(int id = _MYID * BATCH_SIZE; id < data_num; id += 64 * BATCH_SIZE) {
         int start_pos = id;
         int end_pos = id + BATCH_SIZE;
         if(end_pos > data_num) end_pos = data_num;
@@ -227,8 +258,12 @@ extern "C" void tgsfunc(qc_data_tgs *para) {
 
 inline bool HashQueryAndAdd(State *state, uint64_t now, int offset, int len, int eva_len) {
     if(call_times == 0) {
-        //dma_getn(state->bf_zone_ + _PEN * pre_orp_bf_size, slave_bf_zone, pre_orp_bf_size);
-        athread_dma_get(slave_bf_zone, state->bf_zone_ + _PEN * pre_orp_bf_size, pre_orp_bf_size * sizeof(int64_t));
+        //dma_getn(state->bf_zone_ + _MYID * pre_orp_bf_size, slave_bf_zone, pre_orp_bf_size);
+#if SWQC_MANUAL_LDM
+        athread_dma_get(slave_bf_zone, state->bf_zone_ + _MYID * pre_orp_bf_size, pre_orp_bf_size * sizeof(int64_t));
+#else
+        memcpy(slave_bf_zone, state->bf_zone_ + _MYID * pre_orp_bf_size, pre_orp_bf_size * sizeof(int64_t));
+#endif
         athread_ssync_array();
     }
     call_times++;
@@ -291,7 +326,7 @@ void StateORP(State *state, neoReference &ref, CmdInfo *cmd_info_) {
 
 
 
-void StateInfo(State *state, neoReference &ref, CmdInfo *cmd_info_, int *pos_cnt_, int *pos_qul_, int *len_cnt_, int *gc_cnt_, int *qul_cnt_, int &q20bases_, int &q30bases_, int &tot_bases_, int &gc_bases_, int &real_seq_len_, int &lines_){
+void StateInfo(State *state, neoReference &ref, CmdInfo *cmd_info_, int *pos_cnt_, int64_t *pos_qul_, int *len_cnt_, int *gc_cnt_, int *qul_cnt_, int &q20bases_, int &q30bases_, int &tot_bases_, int &gc_bases_, int &real_seq_len_, int &lines_){
     int slen = ref.lseq;
     int qlen = ref.lqual;
     //ASSERT(slen == qlen);
@@ -321,7 +356,8 @@ void StateInfo(State *state, neoReference &ref, CmdInfo *cmd_info_, int *pos_cnt
         } else if (q >= 20) {
             q20bases_++;
         }
-        pos_cnt_[i * 4 + valAGCT[b]]++;
+        const int base_index = valAGCT[b];
+        if (base_index >= 0) pos_cnt_[i * 4 + base_index]++;
         pos_qul_[i] += q;
         //if (bases[i] == 'N') flag = 5;
         //int val = valAGCT[b];
@@ -833,22 +869,22 @@ void PrintRef(neoReference &ref) {
 
 __uncached long lock_s;
 
-extern "C" void formatfunc(format_data paras[64]) {
+extern "C" void formatfunc(format_data paras[SWQC_CPE_COUNT]) {
     
-    //if(paras[_PEN].my_rank) fprintf(stderr, "rank%d - %d\n", paras[_PEN].my_rank, _PEN);
-    format_data *para = &(paras[_PEN]);
+    //if(paras[_MYID].my_rank) fprintf(stderr, "rank%d - %d\n", paras[_MYID].my_rank, _MYID);
+    format_data *para = &(paras[_MYID]);
 
     //athread_lock(&lock_s);
-    //fprintf(stderr, "rank%d - %d : fqSize %d\n", para->my_rank, _PEN, para->fqSize);
+    //fprintf(stderr, "rank%d - %d : fqSize %d\n", para->my_rank, _MYID, para->fqSize);
     //athread_unlock(&lock_s);
     //athread_ssync_array();
 
-    if(_PEN >= para->fqSize) return;
-    //if(_PEN >= 1) return;
+    if(_MYID >= para->fqSize) return;
+    //if(_MYID >= 1) return;
     rabbit::fq::FastqDataChunk *chunk = para->fqdatachunk;
     //fprintf(stderr, "rank%d chunk addr %p\n", para->my_rank, chunk);
     if(para->fqdatachunk == NULL) {
-        para->res[_PEN] = 0; 
+        para->res[_MYID] = 0;
         return;
     }
     uint64_t seq_count = 0;
@@ -875,100 +911,82 @@ extern "C" void formatfunc(format_data paras[64]) {
         seq_count++;
     }
     //athread_lock(&lock_s);
-    //fprintf(stderr, "%d : seq_count %d\n", _PEN, seq_count);
+    //fprintf(stderr, "%d : seq_count %d\n", _MYID, seq_count);
     //athread_unlock(&lock_s);
     //athread_ssync_array();
-    para->res[_PEN] = seq_count;
+    para->res[_MYID] = seq_count;
 //    (*para->data).resize(seq_count);
-    //dma_putn(&(para->res[_PEN]), &seq_count, sizeof(uint64_t));
+    //dma_putn(&(para->res[_MYID]), &seq_count, sizeof(uint64_t));
 }
 
 
-extern "C" void formatpefunc(formatpe_data paras[64]) {
+extern "C" void formatpefunc(formatpe_data paras[SWQC_CPE_COUNT]) {
     
-    //if(paras[_PEN].my_rank) fprintf(stderr, "rank%d - %d\n", paras[_PEN].my_rank, _PEN);
-    formatpe_data *para = &(paras[_PEN]);
+    //if(paras[_MYID].my_rank) fprintf(stderr, "rank%d - %d\n", paras[_MYID].my_rank, _MYID);
+    formatpe_data *para = &(paras[_MYID]);
 
     //athread_lock(&lock_s);
-    //fprintf(stderr, "rank%d - %d : fqSize %d\n", para->my_rank, _PEN, para->fqSize);
+    //fprintf(stderr, "rank%d - %d : fqSize %d\n", para->my_rank, _MYID, para->fqSize);
     //athread_unlock(&lock_s);
     //athread_ssync_array();
 
-    if(_PEN >= para->fqSize) return;
-    //if(_PEN >= 1) return;
+    if(_MYID >= para->fqSize) return;
+    //if(_MYID >= 1) return;
     if(para->fqdatachunk == NULL) {
-        para->res[_PEN] = 0; 
+        para->res[_MYID] = 0;
         return;
     }
     rabbit::fq::FastqDataChunk *chunk1 = para->fqdatachunk->left_part;
     rabbit::fq::FastqDataChunk *chunk2 = para->fqdatachunk->right_part;
     //fprintf(stderr, "rank%d chunk addr %p\n", para->my_rank, chunk);
     uint64_t seq_count1 = 0;
-    uint64_t pos1_ = 0;
+    size_t pos1_ = 0;
     neoReference ref1;
 
     while (true) {
-        ref1.base = chunk1->data.Pointer();
-        ref1.pname = pos1_;
-        if (neoGetLine(chunk1, pos1_, ref1.lname)) {
-            ref1.pseq = pos1_;
-        } else {
-            break;
-        }
-        neoGetLine(chunk1, pos1_, ref1.lseq);
-        ref1.pstrand = pos1_;
-        neoGetLine(chunk1, pos1_, ref1.lstrand);
-        ref1.pqual = pos1_;
-        neoGetLine(chunk1, pos1_, ref1.lqual);
+        int parsed = swqc_fastq_record(chunk1->data.Pointer(), chunk1->size + 1, pos1_, ref1);
+        if (parsed < 0) swqc_cpe_error(11, pos1_, chunk1->size);
+        if (!parsed) break;
         //TODO resize
-        if(seq_count1 >= para->data1->size()) fprintf(stderr, "GG formart, over size: %d %d\n", seq_count1, para->data1->size());
+        if(seq_count1 >= para->data1->size()) swqc_cpe_error(4, seq_count1, para->data1->size());
         (*para->data1)[seq_count1] = ref1;
         seq_count1++;
     }
 
     uint64_t seq_count2 = 0;
-    uint64_t pos2_ = 0;
+    size_t pos2_ = 0;
     neoReference ref2;
 
     while (true) {
-        ref2.base = chunk2->data.Pointer();
-        ref2.pname = pos2_;
-        if (neoGetLine(chunk2, pos2_, ref2.lname)) {
-            ref2.pseq = pos2_;
-        } else {
-            break;
-        }
-        neoGetLine(chunk2, pos2_, ref2.lseq);
-        ref2.pstrand = pos2_;
-        neoGetLine(chunk2, pos2_, ref2.lstrand);
-        ref2.pqual = pos2_;
-        neoGetLine(chunk2, pos2_, ref2.lqual);
+        int parsed = swqc_fastq_record(chunk2->data.Pointer(), chunk2->size + 1, pos2_, ref2);
+        if (parsed < 0) swqc_cpe_error(12, pos2_, chunk2->size);
+        if (!parsed) break;
         //TODO resize
-        if(seq_count2 >= para->data2->size()) fprintf(stderr, "GG formart, over size: %d %d\n", seq_count2, para->data2->size());
+        if(seq_count2 >= para->data2->size()) swqc_cpe_error(5, seq_count2, para->data2->size());
         (*para->data2)[seq_count2] = ref2;
         seq_count2++;
     }
 
     if(seq_count1 != seq_count2) {
-        fprintf(stderr, "rank%d-%d: pr format error, %d %d\n", para->my_rank, _PEN, seq_count1, seq_count2);
+        swqc_cpe_error(6, seq_count1, seq_count2);
     }
 
     //athread_lock(&lock_s);
-    //fprintf(stderr, "%d : seq_count %d\n", _PEN, seq_count);
+    //fprintf(stderr, "%d : seq_count %d\n", _MYID, seq_count);
     //athread_unlock(&lock_s);
     //athread_ssync_array();
-    para->res[_PEN] = seq_count1;
-    //dma_putn(&(para->res[_PEN]), &seq_count, sizeof(uint64_t));
+    para->res[_MYID] = seq_count1;
+    //dma_putn(&(para->res[_MYID]), &seq_count, sizeof(uint64_t));
 }
 
 struct state_data {
-    State *states[64];
+    State *states[SWQC_CPE_COUNT];
     int eva_len;
 };
 
 extern "C" void statemergefunc(state_data *para){
-    if(_PEN % 4) return;
-    int pid = _PEN;
+    if(_MYID % 4) return;
+    int pid = _MYID;
     State *res_state = para->states[pid];
     int eva_len = para->eva_len;
     for(int id = pid + 1; id < pid + 4; id++) {
@@ -985,7 +1003,7 @@ extern "C" void statemergefunc(state_data *para){
         }
     }
 
-    if(_PEN % 16) return;
+    if(_MYID % 16) return;
     res_state = para->states[pid];
     for(int id = pid + 4; id < pid + 16; id += 4) {
         State *item = para->states[id];
@@ -1004,22 +1022,22 @@ extern "C" void statemergefunc(state_data *para){
 }
 
 struct SeMerge_data {
-    char* out_data[64];
-    int out_lens[64] = {0};
-    std::vector <neoReference> *pass_data[64];
-    int pass_data_size[64];
+    char* out_data[SWQC_CPE_COUNT];
+    int out_lens[SWQC_CPE_COUNT] = {0};
+    std::vector <neoReference> *pass_data[SWQC_CPE_COUNT];
+    int pass_data_size[SWQC_CPE_COUNT];
 };
 
 
 struct PeMerge_data {
-    char* out_data1[64];
-    char* out_data2[64];
-    int out_lens1[64] = {0};
-    int out_lens2[64] = {0};
-    std::vector <neoReference> *pass_data1[64];
-    std::vector <neoReference> *pass_data2[64];
-    int pass_data_size1[64];
-    int pass_data_size2[64];
+    char* out_data1[SWQC_CPE_COUNT];
+    char* out_data2[SWQC_CPE_COUNT];
+    int out_lens1[SWQC_CPE_COUNT] = {0};
+    int out_lens2[SWQC_CPE_COUNT] = {0};
+    std::vector <neoReference> *pass_data1[SWQC_CPE_COUNT];
+    std::vector <neoReference> *pass_data2[SWQC_CPE_COUNT];
+    int pass_data_size1[SWQC_CPE_COUNT];
+    int pass_data_size2[SWQC_CPE_COUNT];
 };
 
 void SlaveRead2Chars(neoReference &ref, char *out_data, int &pos) {
@@ -1038,25 +1056,25 @@ void SlaveRead2Chars(neoReference &ref, char *out_data, int &pos) {
 }
 
 extern "C" void semergefunc(SeMerge_data *se_merge_data) {
-    auto vecs = *(se_merge_data->pass_data[_PEN]);
+    auto vecs = *(se_merge_data->pass_data[_MYID]);
     int tmp_len = 0;
     int pos = 0;
     char* start_pos = NULL;
-    for(int i = 0; i < se_merge_data->pass_data_size[_PEN]; i++) {
+    for(int i = 0; i < se_merge_data->pass_data_size[_MYID]; i++) {
         if(vecs[i].lname == 0 || vecs[i].pname + vecs[i].lname + vecs[i].lseq + vecs[i].lstrand + 3 != vecs[i].pqual) {
             //this record has been trimmed
-            if(tmp_len) memcpy(se_merge_data->out_data[_PEN] + pos, start_pos, tmp_len);
+            if(tmp_len) memcpy(se_merge_data->out_data[_MYID] + pos, start_pos, tmp_len);
             pos += tmp_len;
-            if(vecs[i].lname) SlaveRead2Chars(vecs[i], se_merge_data->out_data[_PEN], pos);
+            if(vecs[i].lname) SlaveRead2Chars(vecs[i], se_merge_data->out_data[_MYID], pos);
             tmp_len = 0;
-            if(i < se_merge_data->pass_data_size[_PEN] - 1) {
+            if(i < se_merge_data->pass_data_size[_MYID] - 1) {
                 start_pos = (char*)vecs[i + 1].base + vecs[i + 1].pname;
             }
             continue;
         }
         if((char*)vecs[i].base + vecs[i].pname != start_pos + tmp_len) {
             //record is complete, but can extend to last record
-            if(tmp_len) memcpy(se_merge_data->out_data[_PEN] + pos, start_pos, tmp_len);
+            if(tmp_len) memcpy(se_merge_data->out_data[_MYID] + pos, start_pos, tmp_len);
             pos += tmp_len;
             tmp_len = 0;
             start_pos = (char*)vecs[i].base + vecs[i].pname;
@@ -1064,56 +1082,56 @@ extern "C" void semergefunc(SeMerge_data *se_merge_data) {
         tmp_len += vecs[i].lname + vecs[i].lseq + vecs[i].lstrand + vecs[i].lqual + 4;
     }
     if(tmp_len) {
-        memcpy(se_merge_data->out_data[_PEN] + pos, start_pos, tmp_len);
+        memcpy(se_merge_data->out_data[_MYID] + pos, start_pos, tmp_len);
         pos += tmp_len;
         tmp_len == 0;
     }
-    ASSERT(pos == se_merge_data->out_lens[_PEN]);
+    ASSERT(pos == se_merge_data->out_lens[_MYID]);
 //    for (auto item: vecs) {
 //        if(item.lname == 0) continue;
-//        SlaveRead2Chars(item, se_merge_data->out_data[_PEN], pos);
+//        SlaveRead2Chars(item, se_merge_data->out_data[_MYID], pos);
 //    }
-//    assert(pos == se_merge_data->out_lens[_PEN]);
+//    assert(pos == se_merge_data->out_lens[_MYID]);
 }
 
 
 extern "C" void pemergefunc(PeMerge_data *pe_merge_data) {
-    //auto vecs = *(pe_merge_data->pass_data1[_PEN]);
+    //auto vecs = *(pe_merge_data->pass_data1[_MYID]);
     //int pos = 0;
     //for (auto item: vecs) {
     //    if(item.lname == 0) continue;
-    //    SlaveRead2Chars(item, pe_merge_data->out_data1[_PEN], pos);
+    //    SlaveRead2Chars(item, pe_merge_data->out_data1[_MYID], pos);
     //}
-    //assert(pos == pe_merge_data->out_lens1[_PEN]);
+    //assert(pos == pe_merge_data->out_lens1[_MYID]);
 
-    //vecs = *(pe_merge_data->pass_data2[_PEN]);
+    //vecs = *(pe_merge_data->pass_data2[_MYID]);
     //pos = 0;
     //for (auto item: vecs) {
     //    if(item.lname == 0) continue;
-    //    SlaveRead2Chars(item, pe_merge_data->out_data2[_PEN], pos);
+    //    SlaveRead2Chars(item, pe_merge_data->out_data2[_MYID], pos);
     //}
-    //assert(pos == pe_merge_data->out_lens2[_PEN]);
+    //assert(pos == pe_merge_data->out_lens2[_MYID]);
 
 
-    auto vecs = *(pe_merge_data->pass_data1[_PEN]);
+    auto vecs = *(pe_merge_data->pass_data1[_MYID]);
     int tmp_len = 0;
     int pos = 0;
     char* start_pos = NULL;
-    for(int i = 0; i < pe_merge_data->pass_data_size1[_PEN]; i++) {
+    for(int i = 0; i < pe_merge_data->pass_data_size1[_MYID]; i++) {
         if(vecs[i].lname == 0 || vecs[i].pname + vecs[i].lname + vecs[i].lseq + vecs[i].lstrand + 3 != vecs[i].pqual) {
             //this record has been trimmed
-            if(tmp_len) memcpy(pe_merge_data->out_data1[_PEN] + pos, start_pos, tmp_len);
+            if(tmp_len) memcpy(pe_merge_data->out_data1[_MYID] + pos, start_pos, tmp_len);
             pos += tmp_len;
-            if(vecs[i].lname) SlaveRead2Chars(vecs[i], pe_merge_data->out_data1[_PEN], pos);
+            if(vecs[i].lname) SlaveRead2Chars(vecs[i], pe_merge_data->out_data1[_MYID], pos);
             tmp_len = 0;
-            if(i < pe_merge_data->pass_data_size1[_PEN] - 1) {
+            if(i < pe_merge_data->pass_data_size1[_MYID] - 1) {
                 start_pos = (char*)vecs[i + 1].base + vecs[i + 1].pname;
             }
             continue;
         }
         if((char*)vecs[i].base + vecs[i].pname != start_pos + tmp_len) {
             //record is complete, but can extend to last record
-            if(tmp_len) memcpy(pe_merge_data->out_data1[_PEN] + pos, start_pos, tmp_len);
+            if(tmp_len) memcpy(pe_merge_data->out_data1[_MYID] + pos, start_pos, tmp_len);
             pos += tmp_len;
             tmp_len = 0;
             start_pos = (char*)vecs[i].base + vecs[i].pname;
@@ -1121,31 +1139,31 @@ extern "C" void pemergefunc(PeMerge_data *pe_merge_data) {
         tmp_len += vecs[i].lname + vecs[i].lseq + vecs[i].lstrand + vecs[i].lqual + 4;
     }
     if(tmp_len) {
-        memcpy(pe_merge_data->out_data1[_PEN] + pos, start_pos, tmp_len);
+        memcpy(pe_merge_data->out_data1[_MYID] + pos, start_pos, tmp_len);
         pos += tmp_len;
         tmp_len == 0;
     }
-    ASSERT(pos == pe_merge_data->out_lens1[_PEN]);
+    ASSERT(pos == pe_merge_data->out_lens1[_MYID]);
 
-    vecs = *(pe_merge_data->pass_data2[_PEN]);
+    vecs = *(pe_merge_data->pass_data2[_MYID]);
     tmp_len = 0;
     pos = 0;
     start_pos = NULL;
-    for(int i = 0; i < pe_merge_data->pass_data_size2[_PEN]; i++) {
+    for(int i = 0; i < pe_merge_data->pass_data_size2[_MYID]; i++) {
         if(vecs[i].lname == 0 || vecs[i].pname + vecs[i].lname + vecs[i].lseq + vecs[i].lstrand + 3 != vecs[i].pqual) {
             //this record has been trimmed
-            if(tmp_len) memcpy(pe_merge_data->out_data2[_PEN] + pos, start_pos, tmp_len);
+            if(tmp_len) memcpy(pe_merge_data->out_data2[_MYID] + pos, start_pos, tmp_len);
             pos += tmp_len;
-            if(vecs[i].lname) SlaveRead2Chars(vecs[i], pe_merge_data->out_data2[_PEN], pos);
+            if(vecs[i].lname) SlaveRead2Chars(vecs[i], pe_merge_data->out_data2[_MYID], pos);
             tmp_len = 0;
-            if(i < pe_merge_data->pass_data_size2[_PEN] - 1) {
+            if(i < pe_merge_data->pass_data_size2[_MYID] - 1) {
                 start_pos = (char*)vecs[i + 1].base + vecs[i + 1].pname;
             }
             continue;
         }
         if((char*)vecs[i].base + vecs[i].pname != start_pos + tmp_len) {
             //record is complete, but can extend to last record
-            if(tmp_len) memcpy(pe_merge_data->out_data2[_PEN] + pos, start_pos, tmp_len);
+            if(tmp_len) memcpy(pe_merge_data->out_data2[_MYID] + pos, start_pos, tmp_len);
             pos += tmp_len;
             tmp_len = 0;
             start_pos = (char*)vecs[i].base + vecs[i].pname;
@@ -1153,20 +1171,24 @@ extern "C" void pemergefunc(PeMerge_data *pe_merge_data) {
         tmp_len += vecs[i].lname + vecs[i].lseq + vecs[i].lstrand + vecs[i].lqual + 4;
     }
     if(tmp_len) {
-        memcpy(pe_merge_data->out_data2[_PEN] + pos, start_pos, tmp_len);
+        memcpy(pe_merge_data->out_data2[_MYID] + pos, start_pos, tmp_len);
         pos += tmp_len;
         tmp_len == 0;
     }
-    ASSERT(pos == pe_merge_data->out_lens2[_PEN]);
+    ASSERT(pos == pe_merge_data->out_lens2[_MYID]);
 
 }
 
 
-int se_out_len_slave[64];
-int pe_out_len_slave1[64];
-int pe_out_len_slave2[64];
+int se_out_len_slave[SWQC_CPE_COUNT];
+int pe_out_len_slave1[SWQC_CPE_COUNT];
+int pe_out_len_slave2[SWQC_CPE_COUNT];
 
 extern "C" void ngsfunc(qc_data *para){
+#if !SWQC_MANUAL_LDM
+    SwqcReadScratch scratch;
+    unsigned char *local_data1 = scratch.data();
+#endif
     bool is_print = 0;
     unsigned long c_trim = 0;
     unsigned long c_dup = 0;
@@ -1185,16 +1207,16 @@ extern "C" void ngsfunc(qc_data *para){
     unsigned long start_t, end_t;
     unsigned long start_tt, end_tt;
     rtc_(&start_tt);
-    std::vector <neoReference> *data = para->data1_[_PEN];
-    std::vector <neoReference> *pass_data = para->pass_data1_[_PEN];
-    ThreadInfo *thread_info = para->thread_info_[_PEN];
+    std::vector <neoReference> *data = para->data1_[_MYID];
+    std::vector <neoReference> *pass_data = para->pass_data1_[_MYID];
+    ThreadInfo *thread_info = para->thread_info_[_MYID];
     CmdInfo *cmd_info_ = para->cmd_info_;
 
     int bit_len = para->bit_len;
 //    int data_num = data->size();
-    int data_num = para->data1_size[_PEN];
+    int data_num = para->data1_size[_MYID];
     if(data_num == 0) {
-        se_out_len_slave[_PEN] = 0;
+        se_out_len_slave[_MYID] = 0;
         return;
     }
 
@@ -1210,7 +1232,7 @@ extern "C" void ngsfunc(qc_data *para){
     int pre_malloc_seq_len_ = thread_info->pre_state1_->malloc_seq_len_;
     int *pre_len_cnt_ = (int*)ldm_malloc(pre_malloc_seq_len_ * sizeof(int));
     dma_getn(thread_info->pre_state1_->len_cnt_, pre_len_cnt_, pre_malloc_seq_len_);
-    int *pre_pos_qul_ = (int*)ldm_malloc(pre_malloc_seq_len_ * sizeof(int));
+    int64_t *pre_pos_qul_ = (int64_t*)ldm_malloc(pre_malloc_seq_len_ * sizeof(int64_t));
     dma_getn(thread_info->pre_state1_->pos_qul_, pre_pos_qul_, pre_malloc_seq_len_);
 
 
@@ -1218,7 +1240,7 @@ extern "C" void ngsfunc(qc_data *para){
     int aft_malloc_seq_len_ = thread_info->aft_state1_->malloc_seq_len_;
     int *aft_len_cnt_ = (int*)ldm_malloc(aft_malloc_seq_len_ * sizeof(int));
     dma_getn(thread_info->aft_state1_->len_cnt_, aft_len_cnt_, aft_malloc_seq_len_);
-    int *aft_pos_qul_ = (int*)ldm_malloc(aft_malloc_seq_len_ * sizeof(int));
+    int64_t *aft_pos_qul_ = (int64_t*)ldm_malloc(aft_malloc_seq_len_ * sizeof(int64_t));
     dma_getn(thread_info->aft_state1_->pos_qul_, aft_pos_qul_, aft_malloc_seq_len_);
 
     int *pre_gc_cnt_ = (int*)ldm_malloc((gcMax + 1) * sizeof(int));
@@ -1253,7 +1275,7 @@ extern "C" void ngsfunc(qc_data *para){
     int aft_lines_ = 0;
 
     int out_len_salve = 0;
-//    for(int id = _PEN * BATCH_SIZE; id < data_num; id += 64 * BATCH_SIZE) {
+//    for(int id = _MYID * BATCH_SIZE; id < data_num; id += 64 * BATCH_SIZE) {
     for(int id = 0; id < data_num; id += BATCH_SIZE) {
 
 
@@ -1419,9 +1441,9 @@ extern "C" void ngsfunc(qc_data *para){
     }
 
 //    athread_lock(&lock_s);
-//    fprintf(stderr, "slave %d : out_len_salve %d\n", _PEN, out_len_salve);
+//    fprintf(stderr, "slave %d : out_len_salve %d\n", _MYID, out_len_salve);
 //    athread_unlock(&lock_s);
-    se_out_len_slave[_PEN] = out_len_salve;
+    se_out_len_slave[_MYID] = out_len_salve;
 
     rtc_(&end_tt);
     c_loop += end_tt - start_tt;
@@ -1439,8 +1461,8 @@ extern "C" void ngsfunc(qc_data *para){
     dma_putn(thread_info->aft_state1_->gc_cnt_, aft_gc_cnt_, gcMax + 1);
     dma_putn(thread_info->pre_state1_->qul_cnt_, pre_qul_cnt_, pre_qul_range_);
     dma_putn(thread_info->aft_state1_->qul_cnt_, aft_qul_cnt_, aft_qul_range_);
-    ldm_free(pre_pos_qul_, pre_malloc_seq_len_ * sizeof(int));
-    ldm_free(aft_pos_qul_, aft_malloc_seq_len_ * sizeof(int));
+    ldm_free(pre_pos_qul_, pre_malloc_seq_len_ * sizeof(int64_t));
+    ldm_free(aft_pos_qul_, aft_malloc_seq_len_ * sizeof(int64_t));
     ldm_free(pre_len_cnt_, pre_malloc_seq_len_ * sizeof(int));
     ldm_free(aft_len_cnt_, aft_malloc_seq_len_ * sizeof(int));
     ldm_free(pre_gc_cnt_, (gcMax + 1) * sizeof(int));
@@ -1463,7 +1485,7 @@ extern "C" void ngsfunc(qc_data *para){
     thread_info->aft_state1_->lines_ += aft_lines_;
     rtc_(&end_tt);
     c_dma5 += end_tt - start_tt;
-    if(_PEN == 0 && is_print) {
+    if(_MYID == 0 && is_print) {
         printf("== dma all %lf\n", c_dma_all * 1e-6);
         printf("== loop %lf\n", c_loop * 1e-6);
         printf("== dma5 %lf\n", c_dma5 * 1e-6);
@@ -1565,6 +1587,10 @@ void UpdateIterm(neoReference &up, neoReference now) {
 }
 
 extern "C" void ngspefunc(qc_data *para){
+#if !SWQC_MANUAL_LDM
+    SwqcReadScratch scratch1, scratch2;
+    unsigned char *local_data1 = scratch1.data(), *local_data2 = scratch2.data();
+#endif
     bool is_print = 0;
     unsigned long c_trim = 0;
     unsigned long c_dup = 0;
@@ -1583,19 +1609,19 @@ extern "C" void ngspefunc(qc_data *para){
     unsigned long start_t, end_t;
     unsigned long start_tt, end_tt;
     rtc_(&start_tt);
-    std::vector <neoReference> *data1 = para->data1_[_PEN];
-    std::vector <neoReference> *data2 = para->data2_[_PEN];
-    std::vector <neoReference> *pass_data1 = para->pass_data1_[_PEN];
-    std::vector <neoReference> *pass_data2 = para->pass_data2_[_PEN];
-    ThreadInfo *thread_info = para->thread_info_[_PEN];
+    std::vector <neoReference> *data1 = para->data1_[_MYID];
+    std::vector <neoReference> *data2 = para->data2_[_MYID];
+    std::vector <neoReference> *pass_data1 = para->pass_data1_[_MYID];
+    std::vector <neoReference> *pass_data2 = para->pass_data2_[_MYID];
+    ThreadInfo *thread_info = para->thread_info_[_MYID];
     CmdInfo *cmd_info_ = para->cmd_info_;
     int bit_len = para->bit_len;
 
-    int data_num1 = para->data1_size[_PEN];
-    int data_num2 = para->data2_size[_PEN];
+    int data_num1 = para->data1_size[_MYID];
+    int data_num2 = para->data2_size[_MYID];
     if(data_num1 == 0) {
-        pe_out_len_slave1[_PEN] = 0;
-        pe_out_len_slave2[_PEN] = 0;
+        pe_out_len_slave1[_MYID] = 0;
+        pe_out_len_slave2[_MYID] = 0;
         return;
     }
 
@@ -1610,13 +1636,13 @@ extern "C" void ngspefunc(qc_data *para){
 
 
     int pre_malloc_seq_len1_ = thread_info->pre_state1_->malloc_seq_len_;
-    int *pre_pos_qul1_ = (int*)ldm_malloc(pre_malloc_seq_len1_ * sizeof(int));
+    int64_t *pre_pos_qul1_ = (int64_t*)ldm_malloc(pre_malloc_seq_len1_ * sizeof(int64_t));
     dma_getn(thread_info->pre_state1_->pos_qul_, pre_pos_qul1_, pre_malloc_seq_len1_);
     int *pre_len_cnt1_ = (int*)ldm_malloc(pre_malloc_seq_len1_ * sizeof(int));
     dma_getn(thread_info->pre_state1_->len_cnt_, pre_len_cnt1_, pre_malloc_seq_len1_);
 
     int aft_malloc_seq_len1_ = thread_info->aft_state1_->malloc_seq_len_;
-    int *aft_pos_qul1_ = (int*)ldm_malloc(aft_malloc_seq_len1_ * sizeof(int));
+    int64_t *aft_pos_qul1_ = (int64_t*)ldm_malloc(aft_malloc_seq_len1_ * sizeof(int64_t));
     dma_getn(thread_info->aft_state1_->pos_qul_, aft_pos_qul1_, aft_malloc_seq_len1_);
     int *aft_len_cnt1_ = (int*)ldm_malloc(aft_malloc_seq_len1_ * sizeof(int));
     dma_getn(thread_info->aft_state1_->len_cnt_, aft_len_cnt1_, aft_malloc_seq_len1_);
@@ -1650,14 +1676,14 @@ extern "C" void ngspefunc(qc_data *para){
     dma_getn(thread_info->aft_state2_->pos_cnt_, aft_pos_cnt2_, aft_pos_seq_len2);
 
     int pre_malloc_seq_len2_ = thread_info->pre_state2_->malloc_seq_len_;
-    int *pre_pos_qul2_ = (int*)ldm_malloc(pre_malloc_seq_len2_ * sizeof(int));
+    int64_t *pre_pos_qul2_ = (int64_t*)ldm_malloc(pre_malloc_seq_len2_ * sizeof(int64_t));
     dma_getn(thread_info->pre_state2_->pos_qul_, pre_pos_qul2_, pre_malloc_seq_len2_);
     int *pre_len_cnt2_ = (int*)ldm_malloc(pre_malloc_seq_len2_ * sizeof(int));
     dma_getn(thread_info->pre_state2_->len_cnt_, pre_len_cnt2_, pre_malloc_seq_len2_);
 
 
     int aft_malloc_seq_len2_ = thread_info->aft_state2_->malloc_seq_len_;
-    int *aft_pos_qul2_ = (int*)ldm_malloc(aft_malloc_seq_len2_ * sizeof(int));
+    int64_t *aft_pos_qul2_ = (int64_t*)ldm_malloc(aft_malloc_seq_len2_ * sizeof(int64_t));
     dma_getn(thread_info->aft_state2_->pos_qul_, aft_pos_qul2_, aft_malloc_seq_len2_);
     int *aft_len_cnt2_ = (int*)ldm_malloc(aft_malloc_seq_len2_ * sizeof(int));
     dma_getn(thread_info->aft_state2_->len_cnt_, aft_len_cnt2_, aft_malloc_seq_len2_);
@@ -1718,7 +1744,7 @@ extern "C" void ngspefunc(qc_data *para){
 
     int out_len_salve1 = 0;
     int out_len_salve2 = 0;
-//    for(int id = _PEN * BATCH_SIZE; id < data_num1; id += 64 * BATCH_SIZE) {
+//    for(int id = _MYID * BATCH_SIZE; id < data_num1; id += 64 * BATCH_SIZE) {
     for(int id = 0; id < data_num1; id += BATCH_SIZE) {
 
 
@@ -1749,17 +1775,15 @@ extern "C" void ngspefunc(qc_data *para){
 
 
             rtc_(&start_t);
-            neoReference item1;
-            dma_getn(&((*data1)[ids]), &item1, 1);
-            neoReference item1p;
-            dma_getn(&((*data1)[ids]), &item1p, 1);
+            // These small descriptors also serve as mutable stack objects.
+            // Copy once and preserve the main-memory view for serialization.
+            neoReference item1 = (*data1)[ids];
+            neoReference item1p = item1;
             int now_pos1 = item1.pname - item_s1.pname;
             item1.base = &(local_data1[now_pos1]) - item1.pname;
 
-            neoReference item2;
-            dma_getn(&((*data2)[ids]), &item2, 1);
-            neoReference item2p;
-            dma_getn(&((*data2)[ids]), &item2p, 1);
+            neoReference item2 = (*data2)[ids];
+            neoReference item2p = item2;
             int now_pos2 = item2.pname - item_s2.pname;
             item2.base = &(local_data2[now_pos2]) - item2.pname;
             rtc_(&end_t);
@@ -1777,16 +1801,14 @@ extern "C" void ngspefunc(qc_data *para){
 
 
 
-            rtc_(&start_t);
             if (cmd_info_->state_duplicate_) {
+                const unsigned long duplicate_start = swqc_kernel_clock();
                 StateDupPE(para->duplicate_, item1, item2, ids, bit_len);
+                c_dup += swqc_kernel_clock() - duplicate_start;
             }
             if (cmd_info_->add_umi_) {
                 //TODO
             }
-            rtc_(&end_t);
-            c_dup += end_t - start_t;
-
             rtc_(&start_t);
             bool trim_res1 = 0;
             bool trim_res2 = 0;
@@ -1973,8 +1995,8 @@ extern "C" void ngspefunc(qc_data *para){
         rtc_(&end_t);
         c_dma_dup += end_t - start_t;
     }
-    pe_out_len_slave1[_PEN] = out_len_salve1;
-    pe_out_len_slave2[_PEN] = out_len_salve2;
+    pe_out_len_slave1[_MYID] = out_len_salve1;
+    pe_out_len_slave2[_MYID] = out_len_salve2;
     rtc_(&end_tt);
     c_loop += end_tt - start_tt;
 
@@ -1994,8 +2016,8 @@ extern "C" void ngspefunc(qc_data *para){
     dma_putn(thread_info->aft_state1_->gc_cnt_, aft_gc_cnt1_, gcMax + 1);
     dma_putn(thread_info->pre_state1_->qul_cnt_, pre_qul_cnt1_, pre_qul_range1_);
     dma_putn(thread_info->aft_state1_->qul_cnt_, aft_qul_cnt1_, aft_qul_range1_);
-    ldm_free(pre_pos_qul1_, pre_malloc_seq_len1_ * sizeof(int));
-    ldm_free(aft_pos_qul1_, aft_malloc_seq_len1_ * sizeof(int));
+    ldm_free(pre_pos_qul1_, pre_malloc_seq_len1_ * sizeof(int64_t));
+    ldm_free(aft_pos_qul1_, aft_malloc_seq_len1_ * sizeof(int64_t));
     ldm_free(pre_len_cnt1_, pre_malloc_seq_len1_ * sizeof(int));
     ldm_free(aft_len_cnt1_, aft_malloc_seq_len1_ * sizeof(int));
     ldm_free(pre_gc_cnt1_, (gcMax + 1) * sizeof(int));
@@ -2033,8 +2055,8 @@ extern "C" void ngspefunc(qc_data *para){
     dma_putn(thread_info->aft_state2_->gc_cnt_, aft_gc_cnt2_, gcMax + 1);
     dma_putn(thread_info->pre_state2_->qul_cnt_, pre_qul_cnt2_, pre_qul_range2_);
     dma_putn(thread_info->aft_state2_->qul_cnt_, aft_qul_cnt2_, aft_qul_range2_);
-    ldm_free(pre_pos_qul2_, pre_malloc_seq_len2_ * sizeof(int));
-    ldm_free(aft_pos_qul2_, aft_malloc_seq_len2_ * sizeof(int));
+    ldm_free(pre_pos_qul2_, pre_malloc_seq_len2_ * sizeof(int64_t));
+    ldm_free(aft_pos_qul2_, aft_malloc_seq_len2_ * sizeof(int64_t));
     ldm_free(pre_len_cnt2_, pre_malloc_seq_len2_ * sizeof(int));
     ldm_free(aft_len_cnt2_, aft_malloc_seq_len2_ * sizeof(int));
     ldm_free(pre_gc_cnt2_, (gcMax + 1) * sizeof(int));
@@ -2055,10 +2077,11 @@ extern "C" void ngspefunc(qc_data *para){
     thread_info->aft_state2_->gc_bases_ += aft_gc_bases2_;
     thread_info->aft_state2_->real_seq_len_ = aft_real_seq_len2_;
     thread_info->aft_state2_->lines_ += aft_lines2_;
+    swqc_record_duplicate_ticks(c_dup, data_num1);
 
     rtc_(&end_tt);
     c_dma5 += end_tt - start_tt;
-    if(_PEN == 0 && is_print) {
+    if(_MYID == 0 && is_print) {
         printf("== dma all %lf\n", c_dma_all * 1e-6);
         printf("== loop %lf\n", c_loop * 1e-6);
         printf("== dma5 %lf\n", c_dma5 * 1e-6);
@@ -2079,46 +2102,56 @@ extern "C" void ngspefunc(qc_data *para){
 
 
 struct SeAll_data{
-    format_data para1[64];
+    format_data para1[SWQC_CPE_COUNT];
     qc_data *para2;
     SeMerge_data *para3;
-    int out_len_slave[64];
+    int out_len_slave[SWQC_CPE_COUNT];
     bool write_data;
 };
 
 extern "C" void seallfunc(SeAll_data *se_all_data) {
     formatfunc(se_all_data->para1);
-    se_all_data->para2->data1_size[_PEN] = se_all_data->para1[_PEN].res[_PEN];
+    se_all_data->para2->data1_size[_MYID] = se_all_data->para1[_MYID].res[_MYID];
     ngsfunc(se_all_data->para2);
-    se_all_data->out_len_slave[_PEN] = se_out_len_slave[_PEN];
+    se_all_data->out_len_slave[_MYID] = se_out_len_slave[_MYID];
     if(se_all_data->write_data) {
         semergefunc(se_all_data->para3);
-        se_all_data->para3->pass_data_size[_PEN] = se_all_data->para2->data1_size[_PEN];
+        se_all_data->para3->pass_data_size[_MYID] = se_all_data->para2->data1_size[_MYID];
     }
 }
 
 
 struct PeAll_data{
-    formatpe_data para1[64];
+    formatpe_data para1[SWQC_CPE_COUNT];
     qc_data *para2;
     PeMerge_data *para3;
-    int out_len_slave1[64];
-    int out_len_slave2[64];
+    int out_len_slave1[SWQC_CPE_COUNT];
+    int out_len_slave2[SWQC_CPE_COUNT];
     bool write_data;
 };
 
+#include "swqc_runtime.h"
 extern "C" void peallfunc(PeAll_data *pe_all_data) {
+    const unsigned long t0 = swqc_kernel_clock();
+    swqc_ldm_begin();
     formatpefunc(pe_all_data->para1);
-    pe_all_data->para2->data1_size[_PEN] = pe_all_data->para1[_PEN].res[_PEN];
-    pe_all_data->para2->data2_size[_PEN] = pe_all_data->para1[_PEN].res[_PEN];
+    pe_all_data->para2->data1_size[_MYID] = pe_all_data->para1[_MYID].res[_MYID];
+    pe_all_data->para2->data2_size[_MYID] = pe_all_data->para1[_MYID].res[_MYID];
+    const unsigned long t1 = swqc_kernel_clock();
     ngspefunc(pe_all_data->para2);
-    pe_all_data->out_len_slave1[_PEN] = pe_out_len_slave1[_PEN];
-    pe_all_data->out_len_slave2[_PEN] = pe_out_len_slave2[_PEN];
+    pe_all_data->out_len_slave1[_MYID] = pe_out_len_slave1[_MYID];
+    pe_all_data->out_len_slave2[_MYID] = pe_out_len_slave2[_MYID];
+    const unsigned long t2 = swqc_kernel_clock();
     if(pe_all_data->write_data) {
+        swqc_ldm_transient(1);
         pemergefunc(pe_all_data->para3);
-        pe_all_data->para3->pass_data_size1[_PEN] = pe_all_data->para2->data1_size[_PEN];
-        pe_all_data->para3->pass_data_size2[_PEN] = pe_all_data->para2->data2_size[_PEN];
+        swqc_ldm_transient(0);
+        pe_all_data->para3->pass_data_size1[_MYID] = pe_all_data->para2->data1_size[_MYID];
+        pe_all_data->para3->pass_data_size2[_MYID] = pe_all_data->para2->data2_size[_MYID];
     }
+    swqc_ldm_end();
+    const unsigned long t3 = swqc_kernel_clock();
+    swqc_record_kernel_ticks(t1 - t0, t2 - t1, t3 - t2, t3 - t0);
 }
 
 
@@ -2139,8 +2172,8 @@ struct Para {
     int level;
 };
 
-extern "C" void compressfunc(Para paras[64]) {
-    Para *para = &(paras[_PEN]);
+extern "C" void compressfunc(Para paras[SWQC_CPE_COUNT]) {
+    Para *para = &(paras[_MYID]);
     char* in_buffer = para->in_buffer;
     char* out_buffer = para->out_buffer; 
     size_t in_size = para->in_size;
@@ -2154,8 +2187,8 @@ extern "C" void compressfunc(Para paras[64]) {
 
 }
 
-extern "C" void decompressfunc(Para paras[64]) {
-    Para *para = &(paras[_PEN]);
+extern "C" void decompressfunc(Para paras[SWQC_CPE_COUNT]) {
+    Para *para = &(paras[_MYID]);
     char* in_buffer = para->in_buffer;
     char* out_buffer = para->out_buffer; 
     size_t in_size = para->in_size;
@@ -2175,14 +2208,14 @@ extern "C" void decompressfunc(Para paras[64]) {
 
 struct preOverData{
     std::vector<std::pair<std::string, int>> *hot_s;
-    std::vector<int> *hot_seqs_id[64];
+    std::vector<int> *hot_seqs_id[SWQC_CPE_COUNT];
     int *sizes;
 };
 
 extern "C" void preOverfunc(preOverData *para) {
 
     int size_out = 0;
-    for (int i = _PEN; i < para->hot_s->size(); i += 64) {
+    for (int i = _MYID; i < para->hot_s->size(); i += 64) {
     //for (int i = 0; i < para->hot_s->size(); i++) {
         auto &item = (*para->hot_s)[i];
         const char* seq = item.first.c_str();
@@ -2201,11 +2234,11 @@ extern "C" void preOverfunc(preOverData *para) {
         if (!isSubString) {
             {
                 //athread_lock(&lock_s);
-                (*para->hot_seqs_id[_PEN])[size_out++] = i;
+                (*para->hot_seqs_id[_MYID])[size_out++] = i;
                 //para->hot_seqs_id->push_back(i);
                 //athread_unlock(&lock_s);
             }
         }
     }
-    para->sizes[_PEN] = size_out;
+    para->sizes[_MYID] = size_out;
 }

@@ -1,4 +1,6 @@
 #include "FileReader.h"
+#include "gzip_pipeline.h"
+#include <stdexcept>
 
 extern "C" {
 #include <athread.h>
@@ -13,6 +15,16 @@ namespace rabbit {
         read_times = 0;
         start_pos = 0;
         end_pos = 0;
+        // Small adapter/read-length samples use the host decoder. The actual
+        // QC producer uses the parallel first-pass reader instead.
+        if (swqc_standard_gzip() && swqc_gzip_path(fileName_)) {
+            standard_gzip_ = true;
+            mZipFile = gzopen(fileName_.c_str(), "rb");
+            if (!mZipFile) throw std::runtime_error("cannot open gzip sample: " + fileName_);
+            int first = gzgetc(mZipFile);
+            if (first >= 0) gzungetc(first, mZipFile);
+            return;
+        }
         if (ends_with(fileName_, ".gz") || isZipped) {
 #ifdef USE_LIBDEFLATE
             start_line = startPos;
@@ -225,6 +237,11 @@ namespace rabbit {
 
 
     int64 FileReader::Read(byte *memory_, uint64 size_) {
+        if (standard_gzip_) {
+            int n = gzread(mZipFile, memory_, size_);
+            if (n < 0) throw std::runtime_error("invalid gzip input during FASTQ sampling");
+            return n;
+        }
         if (isZipped) {
 #ifdef USE_LIBDEFLATE
 #ifdef USE_CC_GZ
@@ -310,6 +327,7 @@ namespace rabbit {
     }
 
     bool FileReader::FinishRead() {
+        if (standard_gzip_) return gzeof(mZipFile);
         if (isZipped) {
             //fprintf(stderr, " finish ? %d--%lld %lld\n", iff_idx_end, buffer_now_pos, buffer_tot_size);
 #ifdef USE_LIBDEFLATE

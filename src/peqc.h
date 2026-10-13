@@ -23,6 +23,12 @@
 #include "threadinfo.h"
 #include "umier.h"
 #include "qcdata.h"
+#include "serial_stages.h"
+#include "output_fingerprint.h"
+#include <memory>
+
+class OrderedPairReader;
+class SwqcGzipPairReader;
 
 #include "globalMutex.h"
 
@@ -67,12 +73,8 @@ private:
 //                                  rabbit::core::TDataQueue<rabbit::fq::FastqDataChunk> &dq);
 
     void WriteSeFastqTask12();
-//
-//    void WriteSeFastqTask1();
-//
-//    void WriteSeFastqTask2();
 
-//    void ProcessNgsData(bool &allIsNull, std::vector <neoReference> data1[64], std::vector <neoReference> data2[64], std::vector <rabbit::fq::FastqDataPairChunk *> fqdatachunks, qc_data *para, rabbit::fq::FastqDataPool *fastqPool);
+//    void ProcessNgsData(bool &allIsNull, std::vector <neoReference> data1[SWQC_CPE_COUNT], std::vector <neoReference> data2[SWQC_CPE_COUNT], std::vector <rabbit::fq::FastqDataPairChunk *> fqdatachunks, qc_data *para, rabbit::fq::FastqDataPool *fastqPool);
 
     void ProcessFormatQCWrite(bool &allIsNull, std::vector <neoReference> *data1, std::vector <neoReference> *data2,
                               std::vector <neoReference> *pass_data1, std::vector <neoReference> *pass_data2,
@@ -86,6 +88,13 @@ private:
 private:
 
     int my_rank, comm_size;
+    SwqcSerialStages serial_stages_;
+    std::unique_ptr<OrderedPairReader> ordered_reader_;
+    std::unique_ptr<SwqcGzipPairReader> gzip_reader_;
+    uint64_t processed_pairs_ = 0;
+    uint64_t profile_round_ = 0;
+    bool prehashed_output_ = false;
+    SwqcOutputFingerprint output_fingerprints_[2];
     CmdInfo *cmd_info_;
     Filter *filter_;
 
@@ -174,7 +183,7 @@ private:
     std::vector<std::pair<int, size_t>> out_gz_block_sizes2;
 
 #ifdef USE_CC_GZ
-    char* cc_gz_in_buffer[64];
+    char* cc_gz_in_buffer[SWQC_CPE_COUNT];
 #endif
 };
 

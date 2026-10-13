@@ -57,7 +57,7 @@ Version: 2.00
 #include <sys/stat.h>
 #include "mpi.h"
 
-#define slave_num 64
+#define slave_num SWQC_CPE_COUNT
 
 inline double GetTime() {
     struct timeval tv;

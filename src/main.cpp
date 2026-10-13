@@ -2,10 +2,14 @@
 #include "Globals.h"
 #include "cmdinfo.h"
 #include "peqc.h"
+#include "swqc_log.h"
+#include "gzip_pipeline.h"
 #include "seqc.h"
 #include "th_ass.h"
 #include <iostream>
 #include <fstream>
+#include <stdexcept>
+#include <sys/stat.h>
 #include "mpi.h"
 
 #include "globalMutex.h"
@@ -19,39 +23,17 @@ inline bool exists_file(const std::string &name) {
     return f.good();
 }
 
-int main(int argc, char **argv) {
-
-    volatile int aa = 0;
-    bool runLoop = false;
-
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--swpdb") == 0) {
-            runLoop = true;
-            break;
-        }
-    }
-
-    //fprintf(stderr, "aa %d\n", aa);
-    
-    if (runLoop) {
-        while(aa == 0) {
-        }
-    }
-
-    //fprintf(stderr, "aa %d\n", aa);
+int main(int argc, char **argv) try {
 
     int my_rank = 0;
     int comm_size = 1;
-    MPI_Init(&argc, &argv);
+    int provided = MPI_THREAD_SINGLE;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    if (provided < MPI_THREAD_MULTIPLE) {
+        fprintf(stderr, "SWQC requires MPI_THREAD_MULTIPLE for its consumer/writer threads\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
 
-    //int provided;
-
-    //MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-    //if (provided < MPI_THREAD_MULTIPLE)
-    //{
-    //    printf("ERROR: The MPI library does not have full thread support\n");
-    //    MPI_Abort(MPI_COMM_WORLD, 1);
-    //}
     MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
     MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
 #ifdef use_swlu
@@ -62,7 +44,7 @@ int main(int argc, char **argv) {
     
 
     //printf(" %d / %d\n", my_rank, comm_size);
-    if(my_rank != 0) freopen("dev/null", "w", stdout);
+    if(my_rank != 0) freopen("/dev/null", "w", stdout);
     //if(my_rank == 0) freopen("dev/null", "w", stdout);
     srand(time(0));
     CmdInfo cmd_info;
@@ -76,10 +58,59 @@ int main(int argc, char **argv) {
     app.add_option("--compressLevel", cmd_info.compression_level_,
             "output file compression level (1 - 9), default is 4");
 
-    int aaaa;
     app.add_flag("--overWrite", cmd_info.overWrite_, "overwrite out file if already exists.");
-    app.add_flag("--swpdb", aaaa, "overwrite out file if already exists.");
     app.add_flag("--splitWrite", cmd_info.splitWrite_, "write split file when using multi-nodes.");
+    bool ordered_output = false;
+    bool standard_gzip = false;
+    bool legacy_gzip = false;
+    bool gzip_full_crc = false;
+    int gzip_workers = SWQC_CPE_COUNT, gzip_chunk_mib = 1;
+    int gzip_read_chunk_kib = 256;
+    std::string gzip_reader = "auto";
+    app.add_flag("--standardGzip", standard_gzip, "force the streaming PE pipeline for plain FASTQ (automatic for .gz paths)");
+    app.add_flag("--legacyGzip", legacy_gzip, "use the historical SWQC private-footer gzip path, not ordinary gzip");
+    app.add_flag("--gzipFullCRC", gzip_full_crc, "scan complete discarded FASTQ for validation (streaming gzip pipeline + discardOutput)");
+    app.add_option("--gzipWorkers", gzip_workers, "CPEs per standard gzip batch (1..configured CPE count)");
+    app.add_option("--gzipChunkMiB", gzip_chunk_mib, "standard gzip raw block/interval target (1..64 MiB)");
+    app.add_option("--gzipReader", gzip_reader, "gzip input: rapid (parallel first pass), zlib (serial), auto (build default)");
+    app.add_option("--gzipReadChunkKiB", gzip_read_chunk_kib, "parallel reader compressed-byte target (64..4096 KiB)");
+    bool posix_output = false;
+    bool serial_stages = false;
+    bool discard_output = false, output_fingerprint = false, preload_input = false;
+    bool borrow_input = false, cpe_fingerprint = false, defer_logs = false;
+    int preload_limit_mib = 16384;
+    int input_readers = 1;
+    int memory_workers = 1;
+    int ordered_chunk_kib = 1024;
+    uint64_t replay_pairs = 0, replay_copies = 20;
+    int replay_limit_mib = 1024;
+    std::string replay_layout = "source";
+    int replay_block_chunks = 32;
+    uint64_t replay_seed = 1;
+    bool profile_rounds = false;
+    app.add_option("--replayPairs", replay_pairs, "cache this many paired records from the input prefix for diagnostic replay (0 disables)");
+    app.add_option("--replayCopies", replay_copies, "number of full sample replays, default 20");
+    app.add_option("--replayLimitMiB", replay_limit_mib, "replay sample payload/index limit per rank, default 1024 MiB");
+    app.add_option("--replayLayout", replay_layout, "source or qc_blocks: fixed-length real pairs grouped by overlap/quality proxies (synthetic diagnostic)");
+    app.add_option("--replayBlockChunks", replay_block_chunks, "consecutive feature-correlated CPE chunks per shuffled block, default 32");
+    app.add_option("--replaySeed", replay_seed, "rank-independent replay block shuffle seed, default 1");
+    app.add_flag("--profileRounds", profile_rounds, "record input features and CPE/coordination time for each processor round");
+    app.add_option("--orderedChunkKiB", ordered_chunk_kib, "nominal FASTQ bytes per CPE and mate (64..1024 KiB, ordered input only)");
+    app.add_option("--inputReaders", input_readers, "input window readers per rank (1, or 6 for BigShare)");
+    app.add_option("--memoryWorkers", memory_workers, "BigShare resident-buffer copy workers (1 or 6, default 1)");
+    int input_window_mib = 0, output_window_mib = 0;
+    app.add_option("--inputWindowMiB", input_window_mib, "ordered input read-ahead window (0 disables, otherwise 4..256 MiB)");
+    app.add_option("--outputWindowMiB", output_window_mib, "ordered output contiguous write buffer (0..256 MiB)");
+    app.add_flag("--orderedOutput", ordered_output, "preserve global input order in uncompressed paired output");
+    app.add_flag("--posixOutput", posix_output, "use positional POSIX writes for ordered plain paired output");
+    app.add_flag("--serialStages", serial_stages, "run reader, processor and writer in separate synchronized phases");
+    app.add_flag("--discardOutput", discard_output, "retain ordered output generation and coordination, skip physical writes");
+    app.add_flag("--outputFingerprint", output_fingerprint, "sample output bytes at global 4096-byte intervals (not MD5)");
+    app.add_flag("--cpeFingerprint", cpe_fingerprint, "calculate the same ordered output fingerprint on CPEs");
+    app.add_flag("--deferLogs", defer_logs, "print normal pipeline diagnostics after timing (errors remain live)");
+    app.add_flag("--preloadInput", preload_input, "load this rank's complete real input before pipeline timing");
+    app.add_flag("--borrowInput", borrow_input, "reference stable preloaded FASTQ bytes without input copies");
+    app.add_option("--preloadLimitMiB", preload_limit_mib, "maximum paired preload payload per rank, default 16384 MiB");
     app.add_flag("--phred64", cmd_info.isPhred64_, "input is using phred64 scoring, default is phred33");
     app.add_flag("--stdin", cmd_info.isStdin_,
             "input from stdin, or -i /dev/stdin, only for se data or interleaved pe data(which means use --interleavedIn)");
@@ -179,6 +210,154 @@ int main(int argc, char **argv) {
     app.add_flag("-C", preCache, "pre cache data");
 
     CLI11_PARSE(app, argc, argv);
+    standard_gzip = swqc_select_standard_gzip(standard_gzip, legacy_gzip,
+        {cmd_info.in_file_name1_, cmd_info.in_file_name2_,
+         cmd_info.out_file_name1_, cmd_info.out_file_name2_});
+    if (standard_gzip)
+        swqc_validate_gzip_paths(cmd_info.in_file_name1_, cmd_info.in_file_name2_,
+                                cmd_info.out_file_name1_, cmd_info.out_file_name2_);
+    if (gzip_full_crc && (!standard_gzip || !discard_output)) {
+        fprintf(stderr, "--gzipFullCRC requires the streaming gzip pipeline and --discardOutput\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    setenv("SWQC_GZIP_FULL_CRC", gzip_full_crc ? "1" : "0", 1);
+    if (standard_gzip && (comm_size != 1 || cmd_info.in_file_name2_.empty() ||
+        cmd_info.thread_number_ != 1 || cmd_info.interleaved_in_ || cmd_info.interleaved_out_ ||
+        cmd_info.isStdin_ || cmd_info.isStdout_ ||
+        cmd_info.is_TGS_ || cmd_info.do_overrepresentation_ || ordered_output ||
+        output_fingerprint || cpe_fingerprint || borrow_input || replay_pairs || posix_output ||
+        memory_workers != 1 || input_readers != 1 ||
+        (discard_output && (swqc_gzip_path(cmd_info.out_file_name1_) || swqc_gzip_path(cmd_info.out_file_name2_))) ||
+        cmd_info.splitWrite_ || gzip_workers < 1 || gzip_workers > SWQC_CPE_COUNT ||
+        gzip_chunk_mib < 1 || gzip_chunk_mib > 64 || gzip_read_chunk_kib < 64 || gzip_read_chunk_kib > 4096 ||
+        (gzip_reader != "auto" && gzip_reader != "rapid" && gzip_reader != "zlib"))) {
+        fprintf(stderr, "The standard gzip pipeline (automatic for .gz paths) requires one MPI rank, paired files, -w 1, no replay/ordered MPI/ORP/TGS; gzip workers=1..%d, chunk=1..64 MiB. --legacyGzip is only for the historical private-footer format.\n", SWQC_CPE_COUNT);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    setenv("SWQC_STANDARD_GZIP", standard_gzip ? "1" : "0", 1);
+    setenv("SWQC_GZIP_WORKERS", std::to_string(gzip_workers).c_str(), 1);
+    setenv("SWQC_GZIP_CHUNK_MIB", std::to_string(gzip_chunk_mib).c_str(), 1);
+    setenv("SWQC_GZIP_READER", gzip_reader.c_str(), 1);
+    setenv("SWQC_GZIP_READ_CHUNK_KIB", std::to_string(gzip_read_chunk_kib).c_str(), 1);
+    if (standard_gzip && !discard_output) {
+        for (const auto &path : {cmd_info.out_file_name1_, cmd_info.out_file_name2_}) {
+            struct stat info;
+            if (!path.empty() && lstat(path.c_str(), &info) == 0)
+                throw std::runtime_error("the standard gzip pipeline requires new output paths: " + path);
+        }
+        if (!cmd_info.out_file_name1_.empty() && cmd_info.out_file_name1_ == cmd_info.out_file_name2_)
+            throw std::runtime_error("paired outputs must use different paths");
+    }
+    if (ordered_chunk_kib < 64 || ordered_chunk_kib > 1024 ||
+        (ordered_chunk_kib != 1024 && !ordered_output)) {
+        fprintf(stderr, "--orderedChunkKiB requires ordered input and a value in 64..1024\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    setenv("SWQC_ORDERED_CHUNK_KIB", std::to_string(ordered_chunk_kib).c_str(), 1);
+    setenv("SWQC_DEFER_LOGS", defer_logs ? "1" : "0", 1);
+    if (defer_logs && swqc_log_open_rank(my_rank) != 0) {
+        perror("cannot open rank diagnostic log");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    if (cpe_fingerprint && !output_fingerprint && !discard_output) {
+        fprintf(stderr, "--cpeFingerprint requires --outputFingerprint or --discardOutput\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    setenv("SWQC_CPE_FINGERPRINT", cpe_fingerprint ? "1" : "0", 1);
+    if ((discard_output || output_fingerprint || preload_input || replay_pairs) &&
+        ((!ordered_output && !standard_gzip) || cmd_info.thread_number_ != 1 ||
+         cmd_info.out_file_name1_.empty() || cmd_info.out_file_name2_.empty() ||
+         cmd_info.do_overrepresentation_ || cmd_info.is_TGS_ || posix_output)) {
+        fprintf(stderr, "I/O isolation requires plain ordered paired MPI output, -w 1, without ORP/TGS\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    if (borrow_input && !preload_input) {
+        fprintf(stderr, "--borrowInput requires --preloadInput\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    setenv("SWQC_BORROW_INPUT", borrow_input ? "1" : "0", 1);
+    if (preload_input && ((!standard_gzip && input_window_mib < 4) || preload_limit_mib < 1 || preload_limit_mib > 65536)) {
+        fprintf(stderr, "preload requires an input window and a 1..65536 MiB payload limit per rank\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    setenv("SWQC_DISCARD_OUTPUT", discard_output ? "1" : "0", 1);
+    setenv("SWQC_OUTPUT_FINGERPRINT", (output_fingerprint || discard_output) ? "1" : "0", 1);
+    setenv("SWQC_PRELOAD_INPUT", preload_input ? "1" : "0", 1);
+    setenv("SWQC_PRELOAD_LIMIT_MIB", std::to_string(preload_limit_mib).c_str(), 1);
+    if (replay_pairs && (preload_input || borrow_input || !replay_copies ||
+                        replay_limit_mib < 1 || replay_limit_mib > 2048)) {
+        fprintf(stderr, "replay requires positive copies, a 1..2048 MiB limit, and no preload/borrow\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    setenv("SWQC_REPLAY_PAIRS", std::to_string(replay_pairs).c_str(), 1);
+    setenv("SWQC_REPLAY_COPIES", std::to_string(replay_copies).c_str(), 1);
+    setenv("SWQC_REPLAY_LIMIT_MIB", std::to_string(replay_limit_mib).c_str(), 1);
+    if ((replay_layout != "source" && replay_layout != "qc_blocks") ||
+        replay_block_chunks < 1 || replay_block_chunks > 4096 ||
+        (replay_layout != "source" && (!replay_pairs || cmd_info.isPhred64_))) {
+        fprintf(stderr, "qc_blocks requires replay of fixed-length Phred33 pairs; block chunks must be 1..4096\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    setenv("SWQC_REPLAY_LAYOUT", replay_layout.c_str(), 1);
+    setenv("SWQC_REPLAY_BLOCK_CHUNKS", std::to_string(replay_block_chunks).c_str(), 1);
+    setenv("SWQC_REPLAY_SEED", std::to_string(replay_seed).c_str(), 1);
+    setenv("SWQC_PROFILE_ROUNDS", profile_rounds ? "1" : "0", 1);
+    if (serial_stages && ((!ordered_output && !standard_gzip) || cmd_info.thread_number_ != 1 ||
+        cmd_info.out_file_name1_.empty() || cmd_info.out_file_name2_.empty() ||
+        cmd_info.do_overrepresentation_ || cmd_info.is_TGS_ ||
+        (standard_gzip && (swqc_gzip_path(cmd_info.out_file_name1_) || swqc_gzip_path(cmd_info.out_file_name2_))))) {
+        fprintf(stderr, "--serialStages requires ordered or standard-gzip paired input, plain output, -w 1, without ORP/TGS\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    setenv("SWQC_SERIAL_STAGES", serial_stages ? "1" : "0", 1);
+    if ((input_readers != 1 && input_readers != 6) ||
+        (input_readers > 1 && (!ordered_output || input_window_mib == 0 || SWQC_EXEC_MODE == SWQC_SINGLE))) {
+        fprintf(stderr, "six input readers require BigShare, ordered output and an input window\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    setenv("SWQC_INPUT_READERS", std::to_string(input_readers).c_str(), 1);
+    if ((memory_workers != 1 && memory_workers != 6) ||
+        (memory_workers > 1 && ((!preload_input && !replay_pairs) || input_readers != 1 ||
+                               SWQC_EXEC_MODE == SWQC_SINGLE))) {
+        fprintf(stderr, "six memory workers require BigShare, preload/replay and one input reader\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    setenv("SWQC_MEMORY_WORKERS", std::to_string(memory_workers).c_str(), 1);
+    if (input_window_mib < 0 || input_window_mib > 256 ||
+        (input_window_mib > 0 && input_window_mib < 4) ||
+        output_window_mib < 0 || output_window_mib > 256 ||
+        ((input_window_mib || output_window_mib || posix_output) && !ordered_output)) {
+        fprintf(stderr, "I/O windows require --orderedOutput and valid MiB sizes\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    setenv("SWQC_INPUT_WINDOW_MIB", std::to_string(input_window_mib).c_str(), 1);
+    setenv("SWQC_OUTPUT_WINDOW_MIB", std::to_string(output_window_mib).c_str(), 1);
+    setenv("SWQC_POSIX_OUTPUT", posix_output ? "1" : "0", 1);
+    if (ordered_output) {
+        if (cmd_info.in_file_name2_.empty() || cmd_info.splitWrite_ ||
+            cmd_info.in_file_name1_.find(".gz") != string::npos ||
+            cmd_info.in_file_name2_.find(".gz") != string::npos ||
+            cmd_info.out_file_name1_.find(".gz") != string::npos ||
+            cmd_info.out_file_name2_.find(".gz") != string::npos) {
+            fprintf(stderr, "--orderedOutput requires plain paired FASTQ and shared output\n");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        setenv("SWQC_ORDERED_INPUT", "1", 1);
+    } else {
+        unsetenv("SWQC_ORDERED_INPUT");
+    }
+
+#if SWQC_EXEC_MODE != SWQC_SINGLE
+    if (cmd_info.in_file_name2_.empty() || cmd_info.thread_number_ != 1 ||
+        (!standard_gzip && (cmd_info.in_file_name1_.find(".gz") != string::npos ||
+        cmd_info.in_file_name2_.find(".gz") != string::npos ||
+        cmd_info.out_file_name1_.find(".gz") != string::npos ||
+        cmd_info.out_file_name2_.find(".gz") != string::npos)) ||
+        cmd_info.do_overrepresentation_ || cmd_info.is_TGS_) {
+        fprintf(stderr, "BigShare requires PE, -w 1, without ORP/TGS; legacy gzip is not supported\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+#endif
 
     //TODO remove it
     if(preCache) {
@@ -387,7 +566,7 @@ int main(int argc, char **argv) {
     if (cmd_info.isStdout_) cmd_info.out_file_name1_ = "/dev/stdout";
     if (cmd_info.in_file_name2_.length()) printf("inFile2 is %s\n", cmd_info.in_file_name2_.c_str());
     if (cmd_info.out_file_name1_.length()) {
-        bool res = exists_file(cmd_info.out_file_name1_);
+        bool res = !discard_output && exists_file(cmd_info.out_file_name1_);
         if (res) {
             string tmps;
             if (cmd_info.overWrite_) {
@@ -415,7 +594,7 @@ int main(int argc, char **argv) {
         printf("outFile1 is %s\n", cmd_info.out_file_name1_.c_str());
     }
     if (cmd_info.out_file_name2_.length()) {
-        bool res = exists_file(cmd_info.out_file_name2_);
+        bool res = !discard_output && exists_file(cmd_info.out_file_name2_);
         if (res) {
             string tmps;
             if (cmd_info.overWrite_) {
@@ -577,7 +756,7 @@ int main(int argc, char **argv) {
     //    mx_len = 150;
     //}
     printf("mx_len %d\n", mx_len);
-    cmd_info.seq_len_ = mx_len;
+    cmd_info.seq_len_ = mx_len > 0 ? mx_len : 200;
     if (cmd_info.adapter_fasta_file_.length() > 0) {
         printf("loading adatper from %s\n", cmd_info.adapter_fasta_file_.c_str());
         cmd_info.adapter_from_fasta_ = Adapter::LoadAdaptersFromFasta(cmd_info.adapter_fasta_file_);
@@ -758,4 +937,11 @@ int main(int argc, char **argv) {
     printf("MPI_Finalize done\n");
     //exit(0);
     return 0;
+} catch (const std::exception &e) {
+    fprintf(stderr, "[SWQC error] %s\n", e.what());
+    int initialized = 0, finalized = 0;
+    MPI_Initialized(&initialized);
+    if (initialized) MPI_Finalized(&finalized);
+    if (initialized && !finalized) MPI_Abort(MPI_COMM_WORLD, 1);
+    return 1;
 }

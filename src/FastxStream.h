@@ -334,6 +334,8 @@ namespace rabbit {
                   recordsPool(pool_) {
                 GetNxtBuffSize = mxLen_;
                 tot_read_size2 = 0;
+                const char *standard = getenv("SWQC_STANDARD_GZIP");
+                if (standard && strcmp(standard, "1") == 0) isZipped = false;
                 mFqReader = new FileReader(fileName_, isZipped, startPos, endPos, inMem);
                 if (fileName2_ != "") {
                     mFqReader2 = new FileReader(fileName2_, isZipped, startPos, endPos, inMem);

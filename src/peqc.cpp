@@ -3,8 +3,44 @@
 //
 
 #include "peqc.h"
+#include "swqc_runtime.h"
+#include "ordered_input.h"
+#include "swqc_log.h"
+#include "ring_cursor.h"
+#include "gzip_pipeline.h"
 
 using namespace std;
+
+static int open_output(const char *path, bool split, MPI_File *file)
+{
+    if (swqc_standard_gzip() && swqc_gzip_path(path)) {
+        *file = MPI_FILE_NULL;
+        return MPI_SUCCESS;
+    }
+    if (swqc_discard_output()) {
+        *file = MPI_FILE_NULL;
+        return MPI_SUCCESS;
+    }
+    MPI_Comm comm = split ? MPI_COMM_SELF : MPI_COMM_WORLD;
+    if (swqc_posix_output()) {
+        int rank, failed = 0;
+        MPI_Comm_rank(comm, &rank);
+        if (rank == 0) {
+            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) failed = 1;
+            else if (close(fd) != 0) failed = 1;
+        }
+        if (MPI_Bcast(&failed, 1, MPI_INT, 0, comm) != MPI_SUCCESS || failed)
+            swqc_io_fail("cannot create POSIX output");
+        *file = MPI_FILE_NULL;
+        return MPI_SUCCESS;
+    }
+    int result = MPI_File_open(comm, path, MPI_MODE_CREATE | MPI_MODE_WRONLY,
+                               MPI_INFO_NULL, file);
+    if (result == MPI_SUCCESS) result = MPI_File_set_size(*file, 0);
+    return result;
+}
+
 
 
 extern "C" {
@@ -13,6 +49,7 @@ extern "C" {
     void slave_ngspefunc();
     void slave_formatpefunc();
     void slave_peallfunc();
+    void slave_swqc_output_fingerprint();
     void slave_decompressfunc();
     void slave_compressfunc();
 }
@@ -100,6 +137,8 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
     //out_queue2_ = NULL;
     in_is_zip_ = cmd_info1->in_file_name1_.find(".gz") != string::npos;
     out_is_zip_ = cmd_info1->out_file_name1_.find(".gz") != string::npos;
+    // Standard gzip delivers/accepts raw FASTQ at the existing QC queues.
+    if (swqc_standard_gzip()) in_is_zip_ = out_is_zip_ = false;
 
     if(in_is_zip_ && comm_size > 1) {
 #ifdef USE_LIBDEFLATE
@@ -130,7 +169,7 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
     int64_t start_pos, end_pos;
     if(in_is_zip_) {
 #ifdef USE_CC_GZ
-        for(int i = 0; i < 64; i++) {
+        for(int i = 0; i < SWQC_CPE_COUNT; i++) {
             cc_gz_in_buffer[i] = new char[BLOCK_SIZE];
         }
 #endif
@@ -198,7 +237,7 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
 
 
     int64_t right_pos;
-    if(in_is_zip_) {
+    if(in_is_zip_ || swqc_standard_gzip()) {
         right_pos = 0;
     } else {
         FILE *pre_fp;
@@ -242,7 +281,7 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
     if(my_rank == comm_size - 1) end_pos_ = real_file_size;
     else end_pos_ = now_poss[my_rank + 1];
 
-    p_out_queue_ = new vector<rabbit::fq::FastqDataPairChunk *>[1 << 20];
+    p_out_queue_ = new vector<rabbit::fq::FastqDataPairChunk *>[Q_lim_pe];
     p_queueP1 = 0;
     p_queueP2 = 0;
     p_queueNumNow = 0;
@@ -251,11 +290,11 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
  
     if (cmd_info1->write_data_) {
 
-        out_queue_ = new pair<CIPair, CIPair>[1 << 20];
+        out_queue_ = new pair<CIPair, CIPair>[Q_lim_pe * SWQC_CPE_COUNT];
         queueP1 = 0;
         queueP2 = 0;
         queueNumNow = 0;
-        queueSizeLim = Q_lim_pe * 64;
+        queueSizeLim = Q_lim_pe * SWQC_CPE_COUNT;
         if(use_out_mem) {
             OutMemData1 = new char[128 << 20];
             OutMemData2 = new char[128 << 20];
@@ -272,16 +311,8 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
 
 #ifdef USE_LIBDEFLATE
 
-                ofstream file1(cmd_info1->out_file_name1_.c_str());
 
-                if (file1.is_open()) {
-                    file1 << "Hello, file1!" << endl;
-                    file1.close();
-                } else {
-                    cerr << "Failed to open file1: " << cmd_info1->out_file_name1_ << endl;
-                }
-
-                int err1 = MPI_File_open(MPI_COMM_WORLD, cmd_info1->out_file_name1_.c_str(), MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL, &fh1);
+                int err1 = open_output(cmd_info1->out_file_name1_.c_str(), cmd_info1->splitWrite_, &fh1);
 
                 if (err1 != MPI_SUCCESS) {
                     char error_string[BUFSIZ];
@@ -296,16 +327,8 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
                     exit(0);
                 }
 
-                ofstream file2(cmd_info1->out_file_name2_.c_str());
 
-                if (file2.is_open()) {
-                    file2 << "Hello, file2!" << endl;
-                    file2.close();
-                } else {
-                    cerr << "Failed to open file2: " << cmd_info1->out_file_name2_ << endl;
-                }
-
-                int err2 = MPI_File_open(MPI_COMM_WORLD, cmd_info1->out_file_name2_.c_str(), MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL, &fh2);
+                int err2 = open_output(cmd_info1->out_file_name2_.c_str(), cmd_info1->splitWrite_, &fh2);
 
                 if (err2 != MPI_SUCCESS) {
                     char error_string[BUFSIZ];
@@ -339,16 +362,8 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
 
 #ifdef use_mpi_file
 
-            ofstream file1(cmd_info1->out_file_name1_.c_str());
 
-            if (file1.is_open()) {
-                file1 << "Hello, file!" << endl;
-                file1.close();
-            } else {
-                cerr << "Failed to open file1: " << cmd_info1->out_file_name1_ << endl;
-            }
-
-            int err1 = MPI_File_open(MPI_COMM_WORLD, cmd_info1->out_file_name1_.c_str(), MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL, &fh1);
+            int err1 = open_output(cmd_info1->out_file_name1_.c_str(), cmd_info1->splitWrite_, &fh1);
 
             if (err1 != MPI_SUCCESS) {
                 char error_string[BUFSIZ];
@@ -365,16 +380,8 @@ PeQc::PeQc(CmdInfo *cmd_info1, int my_rank_, int comm_size_) {
 
             if (cmd_info_->interleaved_out_ == 0) {
 
-                ofstream file2(cmd_info1->out_file_name2_.c_str());
 
-                if (file2.is_open()) {
-                    file2 << "Hello, file2!" << endl;
-                    file2.close();
-                } else {
-                    cerr << "Failed to open file2: " << cmd_info1->out_file_name2_ << endl;
-                }
-
-                int err2 = MPI_File_open(MPI_COMM_WORLD, cmd_info1->out_file_name2_.c_str(), MPI_MODE_CREATE | MPI_MODE_WRONLY, MPI_INFO_NULL, &fh2);
+                int err2 = open_output(cmd_info1->out_file_name2_.c_str(), cmd_info1->splitWrite_, &fh2);
 
                 if (err2 != MPI_SUCCESS) {
                     char error_string[BUFSIZ];
@@ -481,7 +488,7 @@ PeQc::~PeQc() {
     }
     if(in_is_zip_) {
 #ifdef USE_CC_GZ
-        for(int i = 0; i < 64; i++) {
+        for(int i = 0; i < SWQC_CPE_COUNT; i++) {
             delete []cc_gz_in_buffer[i];
         }
 #endif
@@ -532,6 +539,25 @@ void PeQc::ProducerPeFastqTask64(string file, string file2, rabbit::fq::FastqDat
     bool is_first = 1;
     int64_t tot_size = 0;
     vector<rabbit::fq::FastqDataPairChunk *> tmp_chunks;
+    OrderedPairReader *ordered = ordered_reader_.get();
+    if (serial_stages_.enabled()) {
+        bool eof = false;
+        while (serial_stages_.reader()) {
+            double tt = GetTime();
+            tmp_chunks.clear();
+            for (int i = 0; i < SWQC_CPE_COUNT && !eof; ++i) {
+                auto *pair = gzip_reader_ ? gzip_reader_->next(fastqPool) : ordered->next(fastqPool);
+                if (!pair) { eof = true; break; }
+                tmp_chunks.push_back(pair);
+            }
+            t_sum1 += GetTime() - tt;
+            p_out_queue_[swqc_next_ring_slot(p_queueP2, p_queueSizeLim)] = tmp_chunks;
+            ++p_queueNumNow;
+            serial_stages_.read_done();
+        }
+        swqc_log_fprintf(stderr, "producer%d sum1 cost %lf\n", my_rank, t_sum1);
+        return;
+    }
     while (true) {
         double tt0 = GetTime();
         rabbit::fq::FastqDataPairChunk *fqdatachunk;
@@ -544,7 +570,8 @@ void PeQc::ProducerPeFastqTask64(string file, string file2, rabbit::fq::FastqDat
             offset = -1;
         }
         is_first = 0;
-        fqdatachunk = fqFileReader->readNextPairChunk();
+        fqdatachunk = gzip_reader_ ? gzip_reader_->next(fastqPool) :
+            (ordered ? ordered->next(fastqPool) : fqFileReader->readNextPairChunk());
         t_sum1 += GetTime() - tt0;
 
         tt0 = GetTime();
@@ -555,7 +582,7 @@ void PeQc::ProducerPeFastqTask64(string file, string file2, rabbit::fq::FastqDat
                     usleep(1000);
                     //fprintf(stderr, "producer %d waiting2\n", my_rank);
                 }
-                p_out_queue_[p_queueP2++] = tmp_chunks;
+                p_out_queue_[swqc_next_ring_slot(p_queueP2, p_queueSizeLim)] = tmp_chunks;
                 p_queueNumNow++;
                 tmp_chunks.clear();
                 n_chunks++;
@@ -565,19 +592,19 @@ void PeQc::ProducerPeFastqTask64(string file, string file2, rabbit::fq::FastqDat
             while (p_queueNumNow >= p_queueSizeLim) {
                 usleep(100);
             }
-            p_out_queue_[p_queueP2++] = tmp_chunks;
+            p_out_queue_[swqc_next_ring_slot(p_queueP2, p_queueSizeLim)] = tmp_chunks;
             p_queueNumNow++;
             break;
         }
         tot_size += fqdatachunk->left_part->size;
         tmp_chunks.push_back(fqdatachunk); 
 //        fprintf(stderr, "producer %d read a chunk\n", my_rank);
-        if(tmp_chunks.size() == 64) {
-//            fprintf(stderr, "producer %d put 64\n", my_rank);
+        if(tmp_chunks.size() == SWQC_CPE_COUNT) {
+//            fprintf(stderr, "producer %d put SWQC_CPE_COUNT\n", my_rank);
             while (p_queueNumNow >= p_queueSizeLim) {
                 usleep(1000);
             }
-            p_out_queue_[p_queueP2++] = tmp_chunks;
+            p_out_queue_[swqc_next_ring_slot(p_queueP2, p_queueSizeLim)] = tmp_chunks;
             p_queueNumNow++;
             tmp_chunks.clear();
             n_chunks++;
@@ -586,10 +613,10 @@ void PeQc::ProducerPeFastqTask64(string file, string file2, rabbit::fq::FastqDat
     }
     //printf("totsize %lld\n", tot_size);
 
-    fprintf(stderr, "producer%d sum1 cost %lf\n", my_rank, t_sum1);
-    fprintf(stderr, "producer%d sum2 cost %lf\n", my_rank, t_sum2);
-    fprintf(stderr, "producer%d cost %lf\n", my_rank, GetTime() - t0);
-    fprintf(stderr, "producer %d in func done\n", my_rank);
+    swqc_log_fprintf(stderr, "producer%d sum1 cost %lf\n", my_rank, t_sum1);
+    swqc_log_fprintf(stderr, "producer%d sum2 cost %lf\n", my_rank, t_sum2);
+    swqc_log_fprintf(stderr, "producer%d cost %lf\n", my_rank, GetTime() - t0);
+    swqc_log_fprintf(stderr, "producer %d in func done\n", my_rank);
     //dq.SetCompleted();
 }
 
@@ -605,22 +632,22 @@ struct formatpe_data {
 };
 
 struct PeMerge_data {
-    char* out_data1[64];
-    char* out_data2[64];
-    int out_lens1[64] = {0};
-    int out_lens2[64] = {0};
-    std::vector <neoReference> *pass_data1[64];
-    std::vector <neoReference> *pass_data2[64];
-    int pass_data_size1[64];
-    int pass_data_size2[64];
+    char* out_data1[SWQC_CPE_COUNT];
+    char* out_data2[SWQC_CPE_COUNT];
+    int out_lens1[SWQC_CPE_COUNT] = {0};
+    int out_lens2[SWQC_CPE_COUNT] = {0};
+    std::vector <neoReference> *pass_data1[SWQC_CPE_COUNT];
+    std::vector <neoReference> *pass_data2[SWQC_CPE_COUNT];
+    int pass_data_size1[SWQC_CPE_COUNT];
+    int pass_data_size2[SWQC_CPE_COUNT];
 };
 
 struct PeAll_data{
-    formatpe_data para1[64];
+    formatpe_data para1[SWQC_CPE_COUNT];
     qc_data *para2;
     PeMerge_data *para3;
-    int out_len_slave1[64];
-    int out_len_slave2[64];
+    int out_len_slave1[SWQC_CPE_COUNT];
+    int out_len_slave2[SWQC_CPE_COUNT];
     bool write_data;
 };
 
@@ -648,6 +675,8 @@ double t_slave_gz = 0;
 double t_slave_gz2 = 0;
 double t_push_q = 0;
 double t_copy_data = 0;
+double t_output_digest = 0;
+double t_output_arrival = 0;
 
 
 struct ConsumerWriteInfoPE{
@@ -661,22 +690,28 @@ struct ConsumerWriteInfoPE{
 
 vector<ConsumerWriteInfoPE> writeInfosPE;
 
-static int pe_pre_out_len_slave1[64];
-static int pe_pre_out_len_slave2[64];
+static int pe_pre_out_len_slave1[SWQC_CPE_COUNT];
+static int pe_pre_out_len_slave2[SWQC_CPE_COUNT];
 
-static int pe_pre_pass_data_size1[64];
-static int pe_pre_pass_data_size2[64];
+static int pe_pre_pass_data_size1[SWQC_CPE_COUNT];
+static int pe_pre_pass_data_size2[SWQC_CPE_COUNT];
 
 void PeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data1, vector <neoReference> *data2,
                           vector <neoReference> *pass_data1, vector <neoReference> *pass_data2,
                           vector <neoReference> *pre_pass_data1, vector <neoReference> *pre_pass_data2,
                           vector <rabbit::fq::FastqDataPairChunk *> fqdatachunks, vector <rabbit::fq::FastqDataPairChunk *> pre_fqdatachunks,
                           qc_data *para, rabbit::fq::FastqDataPool *fastq_data_pool) {
+    const char *profile_setting = getenv("SWQC_PROFILE_ROUNDS");
+    const bool profile_round = profile_setting && strcmp(profile_setting, "1") == 0;
+    const double round_started = GetTime(), cpe_before = tsum3;
+    const double coord_before = tsum4, arrival_before = t_output_arrival;
+    const double release_before = tsum7;
+    const uint64_t pairs_before = processed_pairs_;
     double tt0 = GetTime();
-    formatpe_data para2[64];
-    uint64_t counts[64] = {0};
+    formatpe_data para2[SWQC_CPE_COUNT];
+    uint64_t counts[SWQC_CPE_COUNT] = {0};
     int fq_size = fqdatachunks.size();
-    for(int i = 0; i < 64; i++) {
+    for(int i = 0; i < SWQC_CPE_COUNT; i++) {
         para2[i].fqSize = fq_size;
         para2[i].my_rank = my_rank;
     }
@@ -687,7 +722,7 @@ void PeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data1, v
         para2[i].res = counts;
         para2[i].fqSize = fq_size;
     }
-    for(int i = 0; i < 64; i++) {
+    for(int i = 0; i < SWQC_CPE_COUNT; i++) {
         para->data1_[i] = &data1[i];
         para->data2_[i] = &data2[i];
         para->pass_data1_[i] = &pass_data1[i];
@@ -699,11 +734,11 @@ void PeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data1, v
     PeMerge_data pe_merge_data;
     PeAll_data pe_all_data;
     pe_all_data.write_data = cmd_info_->write_data_;
-    int out_lens1[64] = {0};
-    int out_lens2[64] = {0};
-    char *out_data1[64];
-    char *out_data2[64];
-    for(int i = 0; i < 64; i++) {
+    int out_lens1[SWQC_CPE_COUNT] = {0};
+    int out_lens2[SWQC_CPE_COUNT] = {0};
+    char *out_data1[SWQC_CPE_COUNT];
+    char *out_data2[SWQC_CPE_COUNT];
+    for(int i = 0; i < SWQC_CPE_COUNT; i++) {
         pe_all_data.para1[i] = para2[i];
         pe_all_data.out_len_slave1[i] = 0;
         pe_all_data.out_len_slave2[i] = 0;
@@ -716,7 +751,7 @@ void PeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data1, v
             else out_data2[i] = (char *)(NULL);
         }
     }
-    for(int i = 0; i < 64; i++) {
+    for(int i = 0; i < SWQC_CPE_COUNT; i++) {
         pe_merge_data.out_data1[i] = out_data1[i];
         pe_merge_data.out_lens1[i] = out_lens1[i];
         pe_merge_data.pass_data1[i] = &(pre_pass_data1[i]);
@@ -732,9 +767,9 @@ void PeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data1, v
     tsum2 += GetTime() - tt0;
 
     tt0 = GetTime();
-    __real_athread_spawn((void *)slave_peallfunc, &pe_all_data, 1);
-    athread_join();
+    swqc_runtime_run((void *)slave_peallfunc, &pe_all_data);
     tsum3 += GetTime() - tt0;
+    for (int i = 0; i < SWQC_CPE_COUNT; ++i) processed_pairs_ += counts[i];
 
 
     tt0 = GetTime();
@@ -748,14 +783,16 @@ void PeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data1, v
 #endif
         if(!out_is_zip_ || use_consumer_libdeflate == 0) {
             int out_len1 = 0;
-            for(int i = 0; i < 64; i++) {
+            for(int i = 0; i < SWQC_CPE_COUNT; i++) {
                 out_len1 += out_lens1[i];
             }
             if(cmd_info_->splitWrite_ == 0) {
                 int now_size1 = out_len1;
                 int now_sizes1[comm_size];
                 now_sizes1[0] = now_size1;
+                const double arrival_started = GetTime();
                 MPI_Barrier(MPI_COMM_WORLD);
+                t_output_arrival += GetTime() - arrival_started;
                 if(my_rank) {
                     MPI_Send(&now_size1, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
                 } else {
@@ -772,7 +809,7 @@ void PeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data1, v
                     MPI_Recv(now_sizes1, comm_size, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 }
                 MPI_Barrier(MPI_COMM_WORLD);
-                int pre_sizes1[comm_size];
+                long long pre_sizes1[comm_size];
                 pre_sizes1[0] = 0;
                 for(int ii = 1; ii < comm_size; ii++) {
                     pre_sizes1[ii] = pre_sizes1[ii - 1] + now_sizes1[ii - 1];
@@ -786,7 +823,7 @@ void PeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data1, v
 
 
                 int out_len2 = 0;
-                for(int i = 0; i < 64; i++) {
+                for(int i = 0; i < SWQC_CPE_COUNT; i++) {
                     out_len2 += out_lens2[i];
                 }
 
@@ -810,7 +847,7 @@ void PeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data1, v
                     MPI_Recv(now_sizes2, comm_size, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 }
                 MPI_Barrier(MPI_COMM_WORLD);
-                int pre_sizes2[comm_size];
+                long long pre_sizes2[comm_size];
                 pre_sizes2[0] = 0;
                 for(int ii = 1; ii < comm_size; ii++) {
                     pre_sizes2[ii] = pre_sizes2[ii - 1] + now_sizes2[ii - 1];
@@ -826,11 +863,11 @@ void PeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data1, v
 
         }
         writeInfosPE.clear();
-        for(int i = 0; i < 64; i++) {
+        for(int i = 0; i < SWQC_CPE_COUNT; i++) {
             writeInfosPE.push_back({out_data1[i], out_data2[i], out_lens1[i], out_lens2[i], now_pos_base1, now_pos_base2});
         }
     }
-    for(int i = 0; i < 64; i++) {
+    for(int i = 0; i < SWQC_CPE_COUNT; i++) {
         pe_pre_out_len_slave1[i] = pe_all_data.out_len_slave1[i];
         pe_pre_out_len_slave2[i] = pe_all_data.out_len_slave2[i];
         pe_pre_pass_data_size1[i] = pe_merge_data.pass_data_size1[i]; 
@@ -841,7 +878,7 @@ void PeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data1, v
     tt0 = GetTime();
     int isNull = 1;
     int all_stop = 1;
-    for(int i = 0; i < 64; i++) {
+    for(int i = 0; i < SWQC_CPE_COUNT; i++) {
         if(counts[i]) isNull = 0;
     }
     if(cmd_info_->splitWrite_ == 0) {
@@ -874,26 +911,38 @@ void PeQc::ProcessFormatQCWrite(bool &allIsNull, vector <neoReference> *data1, v
 
 
     tt0 = GetTime();
-    if(cmd_info_->splitWrite_ == 0 && !all_stop && isNull) {
-        fprintf(stderr, "consumer%d push null\n", my_rank);
+    if(cmd_info_->splitWrite_ == 0 && !all_stop && isNull && !serial_stages_.enabled()) {
+        swqc_log_fprintf(stderr, "consumer%d push null\n", my_rank);
         vector<rabbit::fq::FastqDataPairChunk *> tmp_chunks;
         tmp_chunks.clear();
         while (p_queueNumNow >= p_queueSizeLim) {
             usleep(100);
         }
-        p_out_queue_[p_queueP2++] = tmp_chunks;
+        p_out_queue_[swqc_next_ring_slot(p_queueP2, p_queueSizeLim)] = tmp_chunks;
         p_queueNumNow++;
     }
     tsum6 += GetTime() - tt0;
 
     tt0 = GetTime();
-    for(int i = 0; i < 64; i++) {
+    const rabbit::fq::FastqDataChunk *released_parts[SWQC_CPE_COUNT * 2];
+    size_t released_count = 0;
+    for(int i = 0; i < SWQC_CPE_COUNT; i++) {
         if(pre_fqdatachunks[i] != NULL) {
-            fastq_data_pool->Release(pre_fqdatachunks[i]->left_part);
-            fastq_data_pool->Release(pre_fqdatachunks[i]->right_part);
+            released_parts[released_count++] = pre_fqdatachunks[i]->left_part;
+            released_parts[released_count++] = pre_fqdatachunks[i]->right_part;
         }
     }
+    fastq_data_pool->ReleaseBatch(released_parts, released_count);
+    for (auto *pair : pre_fqdatachunks) delete pair;
     tsum7 += GetTime() - tt0;
+    if (profile_round) {
+        swqc_log_fprintf(stderr, "[SWQC processor round] rank=%d round=%llu pairs=%llu total_s=%.6f cpe_s=%.6f arrival_s=%.6f coord_s=%.6f release_s=%.6f\n",
+            my_rank, (unsigned long long)profile_round_,
+            (unsigned long long)(processed_pairs_ - pairs_before), GetTime() - round_started,
+            tsum3 - cpe_before, t_output_arrival - arrival_before,
+            tsum4 - coord_before, tsum7 - release_before);
+    }
+    ++profile_round_;
 }
 
 inline void gather_and_sort_vectors_pe(int rank, int comm_size, int out_round, vector<pair<int, size_t>>& local_vec, int root) {
@@ -963,38 +1012,50 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
     if(cmd_info_->state_duplicate_) {
         para.bit_len = duplicate_->key_len_base_;
     }
-    athread_init();
+    swqc_runtime_init();
 
     double t0 = GetTime();
 
     vector<rabbit::fq::FastqDataPairChunk *> fqdatachunks;
     vector<rabbit::fq::FastqDataPairChunk *> pre_fqdatachunks;
     int out_round = 0;
-    vector<neoReference> data1[64];
-    vector<neoReference> data2[64];
-    vector<neoReference> pass_data1[64];
-    vector<neoReference> pass_data2[64];
-    vector<neoReference> pre_pass_data1[64];
-    vector<neoReference> pre_pass_data2[64];
+    vector<neoReference> data1[SWQC_CPE_COUNT];
+    vector<neoReference> data2[SWQC_CPE_COUNT];
+    vector<neoReference> pass_data1[SWQC_CPE_COUNT];
+    vector<neoReference> pass_data2[SWQC_CPE_COUNT];
+    vector<neoReference> pre_pass_data1[SWQC_CPE_COUNT];
+    vector<neoReference> pre_pass_data2[SWQC_CPE_COUNT];
     int max_data_size = BLOCK_SIZE / (cmd_info_->seq_len_ * 2);
-    for(int i = 0; i < 64; i++) {
-        data1[i].clear();
-        data2[i].clear();
-        pass_data1[i].clear();
-        pass_data2[i].clear();
-        pre_pass_data1[i].clear();
-        pre_pass_data2[i].clear();
-        pre_fqdatachunks.push_back(NULL);
-        data1[i].resize(max_data_size);
-        data2[i].resize(max_data_size);
-        if(cmd_info_->write_data_) {
-            pass_data1[i].resize(max_data_size);
-            pass_data2[i].resize(max_data_size);
-            pre_pass_data1[i].resize(max_data_size);
-            pre_pass_data2[i].resize(max_data_size);
+    struct VectorInit {
+        vector<neoReference> *data1, *data2, *pass1, *pass2, *previous1, *previous2;
+        int capacity;
+        bool write;
+    } init = {data1, data2, pass_data1, pass_data2, pre_pass_data1, pre_pass_data2,
+              max_data_size, cmd_info_->write_data_};
+    pre_fqdatachunks.assign(SWQC_CPE_COUNT, NULL);
+    double vector_init_started = GetTime();
+    swqc_host_for(SWQC_CPE_COUNT, [](void *opaque, int, size_t begin, size_t end) {
+        auto &v = *static_cast<VectorInit *>(opaque);
+        for (size_t i = begin; i < end; ++i) {
+            v.data1[i].resize(v.capacity);
+            v.data2[i].resize(v.capacity);
+            if (v.write) {
+                v.pass1[i].resize(v.capacity);
+                v.pass2[i].resize(v.capacity);
+                v.previous1[i].resize(v.capacity);
+                v.previous2[i].resize(v.capacity);
+            }
         }
-    }
+    }, &init);
+    swqc_log_fprintf(stderr, "[SWQC host initialization] rank=%d workers=%d vector_s=%.6f\n",
+            my_rank, swqc_host_threads(), GetTime() - vector_init_started);
     while(true) {
+        if (serial_stages_.enabled()) {
+            if (!serial_stages_.processor()) break;
+            // Every rank must finish reading before any CPE enters the kernel.
+            MPI_Barrier(MPI_COMM_WORLD);
+            serial_stages_.processor_ready();
+        }
         double tt0 = GetTime();
         while (p_queueNumNow == 0) {
             usleep(1000);
@@ -1003,10 +1064,10 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
 
 
         tt0 = GetTime();
-        fqdatachunks = p_out_queue_[p_queueP1++];
+        fqdatachunks = p_out_queue_[swqc_next_ring_slot(p_queueP1, p_queueSizeLim)];
         p_queueNumNow--;
 
-        for(int i = fqdatachunks.size(); i < 64; i++) {
+        for(int i = fqdatachunks.size(); i < SWQC_CPE_COUNT; i++) {
             fqdatachunks.push_back(NULL);
         }
 
@@ -1016,9 +1077,9 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
 
             //left chunk
             {
-                Para degz_paras[64];
-                size_t out_size[64] = {0};
-                for (int i = 0; i < 64; i++) {
+                Para degz_paras[SWQC_CPE_COUNT];
+                size_t out_size[SWQC_CPE_COUNT] = {0};
+                for (int i = 0; i < SWQC_CPE_COUNT; i++) {
                     if(fqdatachunks[i] == NULL) {
                         degz_paras[i].in_buffer = NULL;
                         degz_paras[i].in_size = 0;
@@ -1039,7 +1100,7 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
                 }
 
 
-                for (int i = 0; i < 64; i++) {
+                for (int i = 0; i < SWQC_CPE_COUNT; i++) {
                     if(fqdatachunks[i] == NULL) {
                     } else {
                         if(out_size[i]) fqdatachunks[i]->left_part->size = out_size[i] - 1;
@@ -1051,9 +1112,9 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
 
             //right chunk
             {
-                Para degz_paras[64];
-                size_t out_size[64] = {0};
-                for (int i = 0; i < 64; i++) {
+                Para degz_paras[SWQC_CPE_COUNT];
+                size_t out_size[SWQC_CPE_COUNT] = {0};
+                for (int i = 0; i < SWQC_CPE_COUNT; i++) {
                     if(fqdatachunks[i] == NULL) {
                         degz_paras[i].in_buffer = NULL;
                         degz_paras[i].in_size = 0;
@@ -1074,7 +1135,7 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
                 }
 
 
-                for (int i = 0; i < 64; i++) {
+                for (int i = 0; i < SWQC_CPE_COUNT; i++) {
                     if(fqdatachunks[i] == NULL) {
                     } else {
                         if(out_size[i]) fqdatachunks[i]->right_part->size = out_size[i] - 1;
@@ -1098,8 +1159,8 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
 #ifdef CONSUMER_USE_LIBDEFLATE
         tt0 = GetTime();
         if (cmd_info_->write_data_ && out_is_zip_) {
-            Para paras[64];
-            size_t out_size[64] = {0};
+            Para paras[SWQC_CPE_COUNT];
+            size_t out_size[SWQC_CPE_COUNT] = {0};
             for(int i = 0; i < writeInfosPE.size(); i++) {
                 paras[i].in_buffer = writeInfosPE[i].buffer;
                 paras[i].out_buffer = new char[BLOCK_SIZE];
@@ -1107,7 +1168,7 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
                 paras[i].out_size = &(out_size[i]);
                 paras[i].level = 1;
             }
-            for(int i = writeInfosPE.size(); i < 64; i++) {
+            for(int i = writeInfosPE.size(); i < SWQC_CPE_COUNT; i++) {
                 paras[i].in_size = 0;
             }
             double tt00 = GetTime();
@@ -1117,8 +1178,8 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
                 athread_join();
             }
             t_slave_gz2 += GetTime() - tt00;
-            for(int i = 0; i < 64; i++) {
-                out_gz_block_sizes1.push_back(make_pair(out_round * comm_size * 64 + my_rank * 64 + i, out_size[i]));
+            for(int i = 0; i < SWQC_CPE_COUNT; i++) {
+                out_gz_block_sizes1.push_back(make_pair(out_round * comm_size * SWQC_CPE_COUNT + my_rank * SWQC_CPE_COUNT + i, out_size[i]));
             }
 
             int sum_buffer_len1 = 0;
@@ -1165,8 +1226,8 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
             }
 
 
-            Para paras2[64];
-            size_t out_size2[64] = {0};
+            Para paras2[SWQC_CPE_COUNT];
+            size_t out_size2[SWQC_CPE_COUNT] = {0};
             for(int i = 0; i < writeInfosPE.size(); i++) {
                 paras2[i].in_buffer = writeInfosPE[i].buffer2;
                 paras2[i].out_buffer = new char[BLOCK_SIZE];
@@ -1174,7 +1235,7 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
                 paras2[i].out_size = &(out_size2[i]);
                 paras2[i].level = 1;
             }
-            for(int i = writeInfosPE.size(); i < 64; i++) {
+            for(int i = writeInfosPE.size(); i < SWQC_CPE_COUNT; i++) {
                 paras2[i].in_size = 0;
             }
             tt00 = GetTime();
@@ -1184,8 +1245,8 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
                 athread_join();
             }
             t_slave_gz2 += GetTime() - tt00;
-            for(int i = 0; i < 64; i++) {
-                out_gz_block_sizes2.push_back(make_pair(out_round * comm_size * 64 + my_rank * 64 + i, out_size2[i]));
+            for(int i = 0; i < SWQC_CPE_COUNT; i++) {
+                out_gz_block_sizes2.push_back(make_pair(out_round * comm_size * SWQC_CPE_COUNT + my_rank * SWQC_CPE_COUNT + i, out_size2[i]));
             }
             out_round++;
 
@@ -1239,17 +1300,45 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
 
         if (cmd_info_->write_data_) {
             tt0 = GetTime();
-            assert(writeInfosPE.size() == 64);
+            assert(writeInfosPE.size() == SWQC_CPE_COUNT);
             long long real_pre_chunk_pos1 = writeInfosPE[0].file_offset;
             long long real_pre_chunk_pos2 = writeInfosPE[0].file_offset2;
-            for(int i = 0; i < 64; i++) {
+            if (prehashed_output_) {
+                double started = GetTime();
+                SwqcOutputSpan spans1[SWQC_CPE_COUNT], spans2[SWQC_CPE_COUNT];
+                int64_t offset1 = real_pre_chunk_pos1, offset2 = real_pre_chunk_pos2;
+                for (int i = 0; i < SWQC_CPE_COUNT; ++i) {
+                    const auto &w = writeInfosPE[i];
+                    spans1[i] = {w.buffer, size_t(w.buffer_len), offset1};
+                    spans2[i] = {w.buffer2, size_t(w.buffer_len2), offset2};
+                    offset1 += w.buffer_len;
+                    offset2 += w.buffer_len2;
+                }
+                const char *cpe_digest = getenv("SWQC_CPE_FINGERPRINT");
+                if (cpe_digest && strcmp(cpe_digest, "1") == 0) {
+                    SwqcOutputFingerprint results[SWQC_CPE_COUNT][2];
+                    int errors[SWQC_CPE_COUNT];
+                    SwqcFingerprintTask task = {{spans1, spans2}, results, errors};
+                    swqc_runtime_run((void *)slave_swqc_output_fingerprint, &task);
+                    for (int i = 0; i < SWQC_CPE_COUNT; ++i) {
+                        if (errors[i] || !output_fingerprints_[0].combine(results[i][0]) ||
+                            !output_fingerprints_[1].combine(results[i][1]))
+                            swqc_io_fail("invalid CPE output fingerprint batch");
+                    }
+                } else if (!swqc_fingerprint_batch(spans1, SWQC_CPE_COUNT, output_fingerprints_[0]) ||
+                           !swqc_fingerprint_batch(spans2, SWQC_CPE_COUNT, output_fingerprints_[1])) {
+                    swqc_io_fail("invalid output fingerprint batch");
+                }
+                t_output_digest += GetTime() - started;
+            }
+            for(int i = 0; i < SWQC_CPE_COUNT; i++) {
                 while (queueNumNow >= queueSizeLim) {
 #ifdef Verbose
                     //printf("waiting to push a chunk to out queue1\n");
 #endif
                     usleep(1000);
                 }
-                out_queue_[queueP2++] = make_pair(make_pair(writeInfosPE[i].buffer, make_pair(writeInfosPE[i].buffer_len, real_pre_chunk_pos1)), make_pair(writeInfosPE[i].buffer2, make_pair(writeInfosPE[i].buffer_len2, real_pre_chunk_pos2)));
+                out_queue_[swqc_next_ring_slot(queueP2, queueSizeLim)] = make_pair(make_pair(writeInfosPE[i].buffer, make_pair(writeInfosPE[i].buffer_len, real_pre_chunk_pos1)), make_pair(writeInfosPE[i].buffer2, make_pair(writeInfosPE[i].buffer_len2, real_pre_chunk_pos2)));
                 queueNumNow++;
                 real_pre_chunk_pos1 += writeInfosPE[i].buffer_len;
                 real_pre_chunk_pos2 += writeInfosPE[i].buffer_len2;
@@ -1260,7 +1349,7 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
 
         tt0 = GetTime();
         pre_fqdatachunks.clear();
-        for(int i = 0; i < 64; i++) {
+        for(int i = 0; i < SWQC_CPE_COUNT; i++) {
             if(cmd_info_->write_data_) {
                 pass_data1[i].swap(pre_pass_data1[i]);
                 pass_data2[i].swap(pre_pass_data2[i]);
@@ -1268,39 +1357,59 @@ void PeQc::ConsumerPeFastqTask64(ThreadInfo **thread_infos, rabbit::fq::FastqDat
             pre_fqdatachunks.push_back(fqdatachunks[i]);
         }
         t_copy_data += GetTime() - tt0;
+        serial_stages_.processed(allIsNull);
         if(allIsNull) break;
 
     }
 
 
     double tt0 = GetTime();
-    if(cmd_info_->splitWrite_ == 0) {
+    if(cmd_info_->splitWrite_ == 0 && out_is_zip_) {
         gather_and_sort_vectors_pe(my_rank, comm_size, out_round, out_gz_block_sizes1, 0);
         gather_and_sort_vectors_pe(my_rank, comm_size, out_round, out_gz_block_sizes2, 0);
     }
 
-    printf("comm gz block size cost %lf\n", GetTime() - tt0);
+    swqc_log_printf("comm gz block size cost %lf\n", GetTime() - tt0);
 
 
-    fprintf(stderr, "consumer%d NGSnew tot cost %lf\n", my_rank, GetTime() - t0);
-    fprintf(stderr, "consumer%d NGSnew wait producer cost %lf\n", my_rank, t_wait_producer);
-    fprintf(stderr, "consumer%d NGSnew format cost %lf\n", my_rank, t_format);
-    fprintf(stderr, "consumer%d NGSnew resize cost %lf\n", my_rank, t_resize);
-    fprintf(stderr, "consumer%d NGSnew ngsfunc cost %lf\n", my_rank, t_ngsfunc);
-    fprintf(stderr, "consumer%d NGSnew      pre_qc1 cost %lf\n", my_rank, tsum1);
-    fprintf(stderr, "consumer%d NGSnew      pre_qc1 cost %lf\n", my_rank, tsum2);
-    fprintf(stderr, "consumer%d NGSnew      slave cost %lf\n", my_rank, tsum3);
-    fprintf(stderr, "consumer%d NGSnew      write cost %lf (%lf [%lf %lf %lf], %lf, %lf, %lf)\n", my_rank, tsum4, tsum4_1, tsum4_1_1, tsum4_1_2, tsum4_1_3, tsum4_2, tsum4_3, tsum4_4);
-    fprintf(stderr, "consumer%d NGSnew      isnull comm cost %lf\n", my_rank, tsum5);
-    fprintf(stderr, "consumer%d NGSnew      push null comm cost %lf\n", my_rank, tsum6);
-    fprintf(stderr, "consumer%d NGSnew      release cost %lf\n", my_rank, tsum7);
-    fprintf(stderr, "consumer%d NGSnew gz slave cost %lf\n", my_rank, t_slave_gz);
-    fprintf(stderr, "consumer%d NGSnew gz slave2 cost %lf\n", my_rank, t_slave_gz2);
-    fprintf(stderr, "consumer%d NGSnew push to queue cost %lf\n", my_rank, t_push_q);
-    fprintf(stderr, "consumer%d NGSnew copy data cost %lf\n", my_rank, t_copy_data);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew tot cost %lf\n", my_rank, GetTime() - t0);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew wait producer cost %lf\n", my_rank, t_wait_producer);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew format cost %lf\n", my_rank, t_format);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew resize cost %lf\n", my_rank, t_resize);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew ngsfunc cost %lf\n", my_rank, t_ngsfunc);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew      pre_qc1 cost %lf\n", my_rank, tsum1);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew      pre_qc1 cost %lf\n", my_rank, tsum2);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew      slave cost %lf\n", my_rank, tsum3);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew      write cost %lf (%lf [%lf %lf %lf], %lf, %lf, %lf)\n", my_rank, tsum4, tsum4_1, tsum4_1_1, tsum4_1_2, tsum4_1_3, tsum4_2, tsum4_3, tsum4_4);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew      isnull comm cost %lf\n", my_rank, tsum5);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew      push null comm cost %lf\n", my_rank, tsum6);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew      release cost %lf\n", my_rank, tsum7);
+    swqc_log_fprintf(stderr, "[SWQC processor detail] rank=%d input_pairs=%llu prepare_s=%.6f cpe_s=%.6f output_coord_s=%.6f eof_coord_s=%.6f release_s=%.6f\n",
+            my_rank, (unsigned long long)processed_pairs_, tsum1 + tsum2, tsum3, tsum4, tsum5, tsum7);
+    swqc_log_fprintf(stderr, "[SWQC output digest] rank=%d consumer=%d seconds=%.6f\n",
+            my_rank, int(prehashed_output_), t_output_digest);
+    swqc_log_fprintf(stderr, "[SWQC output coordination] rank=%d arrival_s=%.6f after_ready_s=%.6f\n",
+            my_rank, t_output_arrival, tsum4 - t_output_arrival);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew gz slave cost %lf\n", my_rank, t_slave_gz);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew gz slave2 cost %lf\n", my_rank, t_slave_gz2);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew push to queue cost %lf\n", my_rank, t_push_q);
+    swqc_log_fprintf(stderr, "consumer%d NGSnew copy data cost %lf\n", my_rank, t_copy_data);
+    double vector_release_started = GetTime();
+    swqc_host_for(SWQC_CPE_COUNT, [](void *opaque, int, size_t begin, size_t end) {
+        auto &v = *static_cast<VectorInit *>(opaque);
+        for (size_t i = begin; i < end; ++i) {
+            vector<neoReference>().swap(v.data1[i]);
+            vector<neoReference>().swap(v.data2[i]);
+            vector<neoReference>().swap(v.pass1[i]);
+            vector<neoReference>().swap(v.pass2[i]);
+            vector<neoReference>().swap(v.previous1[i]);
+            vector<neoReference>().swap(v.previous2[i]);
+        }
+    }, &init);
+    swqc_log_fprintf(stderr, "[SWQC host release] rank=%d vector_s=%.6f\n",
+            my_rank, GetTime() - vector_release_started);
     done_thread_number_++;
-    athread_halt();
-    fprintf(stderr, "consumer %d in func done\n", my_rank);
+    swqc_log_fprintf(stderr, "consumer %d in func done\n", my_rank);
 }
 
 
@@ -1323,13 +1432,41 @@ void PeQc::WriteSeFastqTask12() {
     double t_write = 0;
     double t_del = 0;
     double t_free = 0;
+    unsigned long serial_items = 0;
+    const char *crc_setting = getenv("SWQC_GZIP_FULL_CRC");
+    const bool full_discard_crc = swqc_standard_gzip() && swqc_discard_output() &&
+        crc_setting && strcmp(crc_setting, "1") == 0;
+    uint32_t discarded_crc[2] = {0, 0};
+    double discard_crc_seconds = 0;
+
+    std::unique_ptr<SwqcWriteWindow> buffered1, buffered2;
+    std::unique_ptr<SwqcGzipWriter> gzip1, gzip2;
+    if (swqc_standard_gzip() && swqc_gzip_path(cmd_info_->out_file_name1_)) {
+        gzip1.reset(new SwqcGzipWriter(cmd_info_->out_file_name1_.c_str(), swqc_gzip_chunk_bytes(),
+                                      swqc_gzip_workers(), cmd_info_->compression_level_));
+        gzip2.reset(new SwqcGzipWriter(cmd_info_->out_file_name2_.c_str(), swqc_gzip_chunk_bytes(),
+                                      swqc_gzip_workers(), cmd_info_->compression_level_));
+    }
+    size_t output_window = swqc_window_bytes("SWQC_OUTPUT_WINDOW_MIB");
+    if (swqc_posix_output()) {
+        buffered1.reset(new SwqcWriteWindow(cmd_info_->out_file_name1_.c_str(), output_window));
+        buffered2.reset(new SwqcWriteWindow(cmd_info_->out_file_name2_.c_str(), output_window));
+    } else if (!out_is_zip_ && !use_out_mem &&
+               (output_window || swqc_discard_output() || swqc_output_fingerprint())) {
+        buffered1.reset(new SwqcWriteWindow(fh1, output_window, swqc_discard_output(), swqc_output_fingerprint() && !prehashed_output_));
+        buffered2.reset(new SwqcWriteWindow(fh2, output_window, swqc_discard_output(), swqc_output_fingerprint() && !prehashed_output_));
+    }
 
     while (true) {
+        if (serial_stages_.enabled() && serial_items % SWQC_CPE_COUNT == 0 &&
+            !serial_stages_.writer()) break;
         double tt0 = GetTime();
         while (queueNumNow == 0) {
             if (done_thread_number_ == cmd_info_->thread_number_) {
+                // Producer may have published its final item after our empty check.
+                if (queueNumNow != 0) break;
                 overWhile = 1;
-                printf("writer %d write done\n", my_rank);
+                swqc_log_printf("writer %d write done\n", my_rank);
                 break;
             }
 
@@ -1337,7 +1474,7 @@ void PeQc::WriteSeFastqTask12() {
             usleep(1000);
         }
         if (overWhile) break;
-        now0 = out_queue_[queueP1++];
+        now0 = out_queue_[swqc_next_ring_slot(queueP1, queueSizeLim)];
         now1 = now0.first;
         now2 = now0.second;
         queueNumNow--;
@@ -1345,7 +1482,22 @@ void PeQc::WriteSeFastqTask12() {
 
 
 
-        if (out_is_zip_) {
+        if (full_discard_crc) {
+            const double started = GetTime();
+            if (now1.second.first) discarded_crc[0] = crc32(discarded_crc[0],
+                reinterpret_cast<const Bytef *>(now1.first), now1.second.first);
+            if (now2.second.first) discarded_crc[1] = crc32(discarded_crc[1],
+                reinterpret_cast<const Bytef *>(now2.first), now2.second.first);
+            discard_crc_seconds += GetTime() - started;
+        }
+        if (gzip1) {
+            tt0 = GetTime();
+            gzip1->append(now1.first, now1.second.first);
+            gzip2->append(now2.first, now2.second.first);
+            tot_size1 += now1.second.first; tot_size2 += now2.second.first;
+            t_write += GetTime() - tt0;
+            delete[] now1.first; delete[] now2.first;
+        } else if (out_is_zip_) {
             if (cmd_info_->use_pigz_) {
                 fprintf(stderr, "use pigz TODO...\n");
                 exit(0);
@@ -1410,13 +1562,14 @@ void PeQc::WriteSeFastqTask12() {
                     memcpy(OutMemData1, now1.first, now1.second.first);
                 } else {
 #ifdef use_mpi_file
-                    //fprintf(stderr, "writer %d write seek\n", my_rank);
-                    if(cmd_info_->splitWrite_ == 0) {
-                        MPI_File_seek(fh1, now1.second.second, MPI_SEEK_SET);
+                    if (buffered1) {
+                        buffered1->append(now1.first, now1.second.first, now1.second.second);
+                    } else {
+                        if(cmd_info_->splitWrite_ == 0) {
+                            MPI_File_seek(fh1, now1.second.second, MPI_SEEK_SET);
+                        }
+                        MPI_File_write(fh1, now1.first, now1.second.first, MPI_CHAR, &status1);
                     }
-                    //fprintf(stderr, "writer %d write ww\n", my_rank);
-                    MPI_File_write(fh1, now1.first, now1.second.first, MPI_CHAR, &status1);
-                    //fprintf(stderr, "writer %d write ww done\n", my_rank);
 #else
                     fseek(out_stream1_, now1.second.second, SEEK_SET);
                     //fprintf(stderr, "rank %d write ww %lld\n", my_rank, now.second.first);
@@ -1441,13 +1594,14 @@ void PeQc::WriteSeFastqTask12() {
                 } else {
 
 #ifdef use_mpi_file
-                    //fprintf(stderr, "writer %d write seek\n", my_rank);
-                    if(cmd_info_->splitWrite_ == 0) {
-                        MPI_File_seek(fh2, now2.second.second, MPI_SEEK_SET);
+                    if (buffered2) {
+                        buffered2->append(now2.first, now2.second.first, now2.second.second);
+                    } else {
+                        if(cmd_info_->splitWrite_ == 0) {
+                            MPI_File_seek(fh2, now2.second.second, MPI_SEEK_SET);
+                        }
+                        MPI_File_write(fh2, now2.first, now2.second.first, MPI_CHAR, &status2);
                     }
-                    //fprintf(stderr, "writer %d write ww\n", my_rank);
-                    MPI_File_write(fh2, now2.first, now2.second.first, MPI_CHAR, &status2);
-                    //fprintf(stderr, "writer %d write ww done\n", my_rank);
 #else
                     fseek(out_stream2_, now2.second.second, SEEK_SET);
                     //fprintf(stderr, "rank %d write ww %lld\n", my_rank, now.second.first);
@@ -1463,6 +1617,54 @@ void PeQc::WriteSeFastqTask12() {
                 //fprintf(stderr, "writer %d write del done\n", my_rank);
             }
             //fprintf(stderr, "writer %d %d done\n", my_rank, cnt++);
+        }
+        if (serial_stages_.enabled() && ++serial_items % SWQC_CPE_COUNT == 0) {
+            double tt = GetTime();
+            if (buffered1) { buffered1->flush(); buffered2->flush(); }
+            t_write += GetTime() - tt;
+            // No rank starts the next read/compute round while a writer runs.
+            MPI_Barrier(MPI_COMM_WORLD);
+            serial_stages_.written();
+        }
+    }
+    if (gzip1) {
+        double tt = GetTime();
+        gzip1->finish(); gzip2->finish();
+        t_write += GetTime() - tt;
+        swqc_gzip_report("deflate", cmd_info_->out_file_name1_.c_str(), gzip1->metrics());
+        swqc_gzip_report("deflate", cmd_info_->out_file_name2_.c_str(), gzip2->metrics());
+    }
+    if (full_discard_crc) {
+        swqc_log_fprintf(stderr, "[SWQC discard CRC] mate=1 bytes=%lld crc32=%08x\n", tot_size1, discarded_crc[0]);
+        swqc_log_fprintf(stderr, "[SWQC discard CRC] mate=2 bytes=%lld crc32=%08x\n", tot_size2, discarded_crc[1]);
+        swqc_log_fprintf(stderr, "[SWQC discard CRC] full_scan_s=%.6f physical_output_bytes=0\n", discard_crc_seconds);
+    }
+    if (buffered1) {
+        double tt = GetTime();
+        buffered1->close();
+        buffered2->close();
+        t_write += GetTime() - tt;
+        swqc_log_fprintf(stderr, "[SWQC output detail] rank=%d window_bytes=%zu calls=%llu bytes=%llu io_s=%.6f copy_s=%.6f discarded=%d physical_calls=%llu physical_bytes=%llu\n",
+                my_rank, output_window,
+                (unsigned long long)(buffered1->calls + buffered2->calls),
+                (unsigned long long)(buffered1->bytes + buffered2->bytes),
+                buffered1->io_s + buffered2->io_s, buffered1->copy_s + buffered2->copy_s,
+                int(swqc_discard_output()),
+                (unsigned long long)(swqc_discard_output() ? 0 : buffered1->calls + buffered2->calls),
+                (unsigned long long)(swqc_discard_output() ? 0 : buffered1->bytes + buffered2->bytes));
+        swqc_log_fprintf(stderr, "[SWQC output backend] rank=%d backend=%s\n",
+                my_rank, swqc_discard_output() ? "discard_ordered" :
+                (swqc_posix_output() ? "pwrite" : "MPI_File_write_at"));
+        if (swqc_output_fingerprint()) {
+            SwqcWriteWindow *windows[2] = {buffered1.get(), buffered2.get()};
+            for (int m = 0; m < 2; ++m) {
+                const auto &f = prehashed_output_ ? output_fingerprints_[m] : windows[m]->fingerprint;
+                swqc_log_fprintf(stderr, "[SWQC output fingerprint] rank=%d mate=%d discarded=%d stride=%d bytes=%llu samples=%llu sum64=%016llx xor64=%016llx end_offset=%llu\n",
+                        my_rank, m + 1, int(swqc_discard_output()), SwqcOutputFingerprint::STRIDE,
+                        (unsigned long long)f.bytes, (unsigned long long)f.samples,
+                        (unsigned long long)f.sum64, (unsigned long long)f.xor64,
+                        (unsigned long long)f.end_offset);
+            }
         }
     }
     if(cmd_info_->splitWrite_ == 0) {
@@ -1508,8 +1710,10 @@ void PeQc::WriteSeFastqTask12() {
 
     } else {
 #ifdef use_mpi_file
-        MPI_File_close(&fh1);
-        MPI_File_close(&fh2);
+        if (!gzip1 && !swqc_posix_output() && !swqc_discard_output()) {
+            MPI_File_close(&fh1);
+            MPI_File_close(&fh2);
+        }
 #else
         fclose(out_stream1_);
         if(my_rank == 0) {
@@ -1539,303 +1743,42 @@ void PeQc::WriteSeFastqTask12() {
         size_t vector_size2 = out_gz_block_sizes2.size();
         ofs2.write(reinterpret_cast<const char*>(&vector_size2), sizeof(size_t));
         ofs2.close();
-        printf("writer final cost %lf\n", GetTime() - tt0);
+        swqc_log_printf("writer final cost %lf\n", GetTime() - tt0);
     }
 
 #ifdef Verbose
-    printf("writer wait queue cost %.4f\n", t_wait);
-    printf("writer gz slave cost %.4f\n", t_gz_slave);
-    printf("writer write cost %.4f\n", t_write);
-    printf("writer del cost %.4f\n", t_del);
-    printf("writer free cost %.4f\n", t_free);
-    printf("writer %d cost %lf, tot size %lld %lld\n", my_rank, GetTime() - t0, tot_size1, tot_size2);
-    fprintf(stderr, "writer %d in func done\n", my_rank);
+    swqc_log_printf("writer wait queue cost %.4f\n", t_wait);
+    swqc_log_printf("writer gz slave cost %.4f\n", t_gz_slave);
+    swqc_log_fprintf(stderr, "[SWQC rank %d] writer_io_seconds=%.6f\n", my_rank, t_write);
+    swqc_log_printf("writer write cost %.4f\n", t_write);
+    swqc_log_printf("writer del cost %.4f\n", t_del);
+    swqc_log_printf("writer free cost %.4f\n", t_free);
+    swqc_log_printf("writer %d cost %lf, tot size %lld %lld\n", my_rank, GetTime() - t0, tot_size1, tot_size2);
+    swqc_log_fprintf(stderr, "writer %d in func done\n", my_rank);
     //printf("write %d cost %.5f --- %lld\n", my_rank, GetTime() - t0, tot_size);
     //
 #endif
 }
 
 
-
-///**
-// * @brief a function to write pe data from out_data1 queue to file1
-// */
-//void PeQc::WriteSeFastqTask1() {
-//#ifdef Verbose
-//    double t0 = GetTime();
-//#endif
-//    int cnt = 0;
-//    long long tot_size = 0;
-//    bool overWhile = 0;
-//    CIPair now;
-//    while (true) {
-//        while (queueNumNow1 == 0) {
-//            if (done_thread_number_ == cmd_info_->thread_number_) {
-//                overWhile = 1;
-//                printf("rank %d write done\n", my_rank);
-//                break;
-//            }
-//
-//            //fprintf(stderr, "rank %d write wait\n", my_rank);
-//            usleep(1000);
-//        }
-//        if (overWhile) break;
-//        now = out_queue1_[queue1P1++];
-//        queueNumNow1--;
-//        //fprintf(stderr, "rank %d write get %p\n", my_rank, now.first);
-//        if (out_is_zip_) {
-//            if (cmd_info_->use_pigz_) {
-//                fprintf(stderr, "use pigz TODO...\n");
-//                exit(0);
-//            } else {
-//                int written = gzwrite(zip_out_stream1, now.first, now.second.first);
-//                if (written != now.second.first) {
-//                    printf("gzwrite error\n");
-//                    exit(0);
-//                }
-//                delete[] now.first;
-//            }
-//        } else {
-//            tot_size += now.second.first;
-//            if(now.second.first) {
-//
-//#ifdef use_mpi_file
-//                //fprintf(stderr, "rank %d write seek %lld\n", my_rank, now.second.first);
-//                MPI_File_seek(fh1, now.second.second, MPI_SEEK_SET);
-//                //fprintf(stderr, "rank %d write ww %lld\n", my_rank, now.second.first);
-//                MPI_File_write(fh1, now.first, now.second.first, MPI_CHAR, &status1);
-//                //fprintf(stderr, "rank %d write ww done\n", my_rank);
-//#else
-//                fseek(out_stream1_, now.second.second, SEEK_SET);
-//                //fprintf(stderr, "rank %d write ww %lld\n", my_rank, now.second.first);
-//                fwrite(now.first, sizeof(char), now.second.first, out_stream1_);
-//                //fprintf(stderr, "rank %d write ww done\n", my_rank);
-//#endif
-//                delete[] now.first;
-//                //fprintf(stderr, "rank %d write del done\n", my_rank);
-//            }
-//            //fprintf(stderr, "write%d %d done\n", my_rank, cnt++);
-//        }
-//    }
-//    //fprintf(stderr, "111111 rank%d donedone1\n", my_rank);
-//    MPI_Barrier(MPI_COMM_WORLD);
-//    //fprintf(stderr, "111111 rank%d donedone2\n", my_rank);
-//    if (out_is_zip_) {
-//        if (cmd_info_->use_pigz_) {
-//            fprintf(stderr, "use pigz TODO...\n");
-//            exit(0);
-//        } else {
-//            if (zip_out_stream1) {
-//                gzflush(zip_out_stream1, Z_FINISH);
-//                gzclose(zip_out_stream1);
-//                zip_out_stream1 = NULL;
-//            }
-//        }
-//
-//    } else {
-//#ifdef use_mpi_file
-//        //fprintf(stderr, "111111 rank%d donedone3\n", my_rank);
-//        MPI_File_close(&fh1);
-//        //fprintf(stderr, "111111 rank%d donedone4\n", my_rank);
-//#else
-//        fclose(out_stream1_);
-//        if(my_rank == 0) {
-//            truncate(cmd_info_->out_file_name1_.c_str(), sizeof(char) * now_pos1_);
-//        }
-//#endif
-//    }
-//#ifdef Verbose
-//    cerr << "write" << my_rank << " cost " << GetTime() - t0 << ", tot size " << tot_size << endl;
-//    //printf("write %d cost %.5f --- %lld\n", my_rank, GetTime() - t0, tot_size);
-//    //
-//#endif
-//}
-//
-///**
-// * @brief a function to write pe data from out_data2 queue to file2
-// */
-//void PeQc::WriteSeFastqTask2() {
-//#ifdef Verbose
-//    double t0 = GetTime();
-//#endif
-//    int cnt = 0;
-//    long long tot_size = 0;
-//    bool overWhile = 0;
-//    CIPair now;
-//    while (true) {
-//        while (queueNumNow2 == 0) {
-//            if (done_thread_number_ == cmd_info_->thread_number_) {
-//                overWhile = 1;
-//                printf("rank %d write done\n", my_rank);
-//                break;
-//            }
-//
-//            //fprintf(stderr, "rank %d write wait\n", my_rank);
-//            usleep(1000);
-//        }
-//        if (overWhile) break;
-//        now = out_queue2_[queue2P1++];
-//        queueNumNow2--;
-//        //fprintf(stderr, "rank %d write get %p\n", my_rank, now.first);
-//        if (out_is_zip_) {
-//            if (cmd_info_->use_pigz_) {
-//                fprintf(stderr, "use pigz TODO...\n");
-//                exit(0);
-//            } else {
-//                int written = gzwrite(zip_out_stream2, now.first, now.second.first);
-//                if (written != now.second.first) {
-//                    printf("gzwrite error\n");
-//                    exit(0);
-//                }
-//                delete[] now.first;
-//            }
-//        } else {
-//            tot_size += now.second.first;
-//            if(now.second.first) {
-//
-//#ifdef use_mpi_file
-//                //fprintf(stderr, "rank %d write seek %lld\n", my_rank, now.second.first);
-//                MPI_File_seek(fh2, now.second.second, MPI_SEEK_SET);
-//                //fprintf(stderr, "rank %d write ww %lld\n", my_rank, now.second.first);
-//                MPI_File_write(fh2, now.first, now.second.first, MPI_CHAR, &status2);
-//                //fprintf(stderr, "rank %d write ww done\n", my_rank);
-//#else
-//                fseek(out_stream2_, now.second.second, SEEK_SET);
-//                //fprintf(stderr, "rank %d write ww %lld\n", my_rank, now.second.first);
-//                fwrite(now.first, sizeof(char), now.second.first, out_stream2_);
-//                //fprintf(stderr, "rank %d write ww done\n", my_rank);
-//#endif
-//                delete[] now.first;
-//                //fprintf(stderr, "rank %d write del done\n", my_rank);
-//            }
-//            //fprintf(stderr, "write%d %d done\n", my_rank, cnt++);
-//        }
-//    }
-//    //fprintf(stderr, "222222 rank%d donedone1\n", my_rank);
-//    MPI_Barrier(MPI_COMM_WORLD);
-//    //fprintf(stderr, "222222 rank%d donedone2\n", my_rank);
-//    if (out_is_zip_) {
-//        if (cmd_info_->use_pigz_) {
-//            fprintf(stderr, "use pigz TODO...\n");
-//            exit(0);
-//        } else {
-//            if (zip_out_stream2) {
-//                gzflush(zip_out_stream2, Z_FINISH);
-//                gzclose(zip_out_stream2);
-//                zip_out_stream2 = NULL;
-//            }
-//        }
-//
-//    } else {
-//#ifdef use_mpi_file
-//        //fprintf(stderr, "222222 rank%d donedone3\n", my_rank);
-//        MPI_File_close(&fh2);
-//        //fprintf(stderr, "222222 rank%d donedone4\n", my_rank);
-//#else
-//        fclose(out_stream2_);
-//        if(my_rank == 0) {
-//            truncate(cmd_info_->out_file_name2_.c_str(), sizeof(char) * now_pos2_);
-//        }
-//#endif
-//    }
-//#ifdef Verbose
-//    cerr << "write" << my_rank << " cost " << GetTime() - t0 << ", tot size " << tot_size << endl;
-//    //printf("write %d cost %.5f --- %lld\n", my_rank, GetTime() - t0, tot_size);
-//    //
-//#endif
-//}
-
-
-bool checkStates(State* s1, State* s2) {
-    int ok = 1;
-    if(s1->q20bases_ != s2->q20bases_) {
-        ok = 0;
-        cerr << "GG1" << endl;
-    }
-
-    if(s1->q30bases_ != s2->q30bases_) {cerr << "GG2" << endl;ok=0;}
-    if(s1->lines_ != s2->lines_) {cerr << "GG3" << endl;ok=0;}
-
-    if(s1->malloc_seq_len_ != s2->malloc_seq_len_) {cerr << "GG4" << endl;ok=0;}
-
-    if(s1->qul_range_ != s2->qul_range_) {cerr << "GG5" << endl;ok=0;}
-
-    if(s1->real_seq_len_ != s2->real_seq_len_) {cerr << "GG6" << endl;ok=0;}
-
-    if(s1->kmer_buf_len_ != s2->kmer_buf_len_) {cerr << "GG7" << endl;ok=0;}
-
-    if(s1->tot_bases_ != s2->tot_bases_) {cerr << "GG8" << endl; ok=0;}
-
-    if(s1->gc_bases_ != s2->gc_bases_) {cerr << "GG9" << endl;ok=0;}
-
-    if(fabs(s1->avg_len - s2->avg_len) / s2->avg_len > 1e-2) {cerr << "GG10" << endl;ok=0;}
-
-    if(s1->pass_reads_ != s2->pass_reads_) {cerr << "GG11" << endl;ok=0;}
-
-    if(s1->fail_short_ != s2->fail_short_) {cerr << "GG12" << endl;ok=0;}
-
-    if(s1->fail_long_ != s2->fail_long_) {cerr << "GG13" << endl;ok=0;}
-
-    if(s1->fail_N_ != s2->fail_N_) {cerr << "GG14" << endl;ok=0;}
-
-    if(s1->fail_lowq_!= s2->fail_lowq_) {cerr << "GG15" << endl;ok=0;}
-
-    if(s1->trim_adapter_ != s2->trim_adapter_) {cerr << "GG16" <<endl;ok=0;}
-
-    if(s1->trim_adapter_bases_ != s2->trim_adapter_bases_) {cerr << "GG17" << endl;ok=0;}
-
-    //pos_qul
-    for(int i = 0; i < s1->real_seq_len_; i++) {
-        if(s1->pos_qul_[i] != s2->pos_qul_[i]) {
-            cerr << "GG18 " << s1->pos_qul_[i] << " " << s2->pos_qul_[i] << endl;
-            ok = 0;
-        }
-    }
-
-    //len_cnt
-    for(int i = 0; i < s1->real_seq_len_; i++) {
-        if(s1->len_cnt_[i] != s2->len_cnt_[i]) {
-            cerr << "GG19 " << s1->len_cnt_[i] << " " << s2->len_cnt_[i] << endl;
-            ok = 0;
-        }
-    }
-
-    //pos_cnt
-    for(int i = 0; i < s1->real_seq_len_; i++) { 
-        for(int j = 0; j < 4; j++) {
-            if(s1->pos_cnt_[i * 4 + j] != s2->pos_cnt_[i * 4 + j]) {
-                cerr << "GG20 " << s1->pos_cnt_[i * 4 + j] << " " << s2->pos_cnt_[i * 4 + j] << endl;
-                ok = 0;
-            }
-        }
-    }
-
-    //qul_cnt
-    for(int i = 0; i < s1->qul_range_; i++) {
-        if(s1->qul_cnt_[i] != s2->qul_cnt_[i]) {
-            cerr << "GG21" << endl;
-            ok = 0;
-        }
-    }
-    //gc_cnt
-    for(int i = 0; i < 100; i++) {
-        if(s1->gc_cnt_[i] != s2->gc_cnt_[i]) {
-            cerr << "GG22" << endl;
-            ok = 0;
-        }
-    }
-
-
-
-    if(ok) return 1;
-    else return 0;
-}
-
-
 void PeQc::ProcessPeFastq() {
+    /* Initialize the CPE resources on the MPI main thread before workers exist. */
+    swqc_runtime_init();
+    const char *serial = getenv("SWQC_SERIAL_STAGES");
+    if (serial && strcmp(serial, "1") == 0) serial_stages_.enable();
+    const char *readers_env = getenv("SWQC_INPUT_READERS");
+    int readers = readers_env ? atoi(readers_env) : 1;
+    const char *memory_env = getenv("SWQC_MEMORY_WORKERS");
+    int memory_workers = memory_env ? atoi(memory_env) : 1;
+    int worker_error = memory_workers > 1 ? 0 : swqc_host_io_init(readers);
+    if (worker_error != 0) swqc_io_fail("host helper initialization failed");
     //if(my_rank == 0) block_size = 6 * (1 << 20);
     //else block_size = 4 * (1 << 20);
-    auto *fastqPool = new rabbit::fq::FastqDataPool(Q_lim_pe * 64 * 2, BLOCK_SIZE);
+    const char *borrow_env = getenv("SWQC_BORROW_INPUT");
+    const bool borrow_input = borrow_env && strcmp(borrow_env, "1") == 0;
+    prehashed_output_ = swqc_output_fingerprint() && !out_is_zip_ && !use_out_mem && !swqc_standard_gzip();
+    auto *fastqPool = new rabbit::fq::FastqDataPool(Q_lim_pe * SWQC_CPE_COUNT * 2,
+        (borrow_input || (swqc_standard_gzip() && swqc_gzip_zero_copy())) ? 0 : BLOCK_SIZE);
     //rabbit::core::TDataQueue<rabbit::fq::FastqDataPairChunk> queue1(Q_lim_pe, 1);
     auto **p_thread_info = new ThreadInfo *[slave_num];
     for (int t = 0; t < slave_num; t++) {
@@ -1844,7 +1787,9 @@ void PeQc::ProcessPeFastq() {
     rabbit::uint32 tmpSize = SWAP1_SIZE;
     if (cmd_info_->seq_len_ <= 200) tmpSize = SWAP2_SIZE;
     
-    if(in_is_zip_) {
+    if (swqc_standard_gzip()) {
+        gzip_reader_.reset(new SwqcGzipPairReader(cmd_info_->in_file_name1_, cmd_info_->in_file_name2_));
+    } else if(in_is_zip_) {
         fqFileReader = new rabbit::fq::FastqFileReader(cmd_info_->in_file_name1_, *fastqPool, cmd_info_->in_file_name2_, in_is_zip_, tmpSize, start_line_, end_line_, use_in_mem);
     } else {
         fqFileReader = new rabbit::fq::FastqFileReader(cmd_info_->in_file_name1_, *fastqPool, cmd_info_->in_file_name2_, in_is_zip_, tmpSize, start_pos_, end_pos_, use_in_mem);
@@ -1852,38 +1797,94 @@ void PeQc::ProcessPeFastq() {
     if(use_in_mem) {
         MPI_Barrier(MPI_COMM_WORLD);
     }
+    if (getenv("SWQC_ORDERED_INPUT")) {
+        const char *chunk_setting = getenv("SWQC_ORDERED_CHUNK_KIB");
+        const int64_t chunk_bytes = chunk_setting ? int64_t(atoi(chunk_setting)) * 1024 : BLOCK_SIZE;
+        if (chunk_bytes < (64 << 10) || chunk_bytes > BLOCK_SIZE)
+            swqc_io_fail("invalid ordered input chunk size");
+        swqc_log_fprintf(stderr, "[SWQC ordered chunks] rank=%d cpes=%d bytes_per_cpe=%lld\n",
+                my_rank, SWQC_CPE_COUNT, (long long)chunk_bytes);
+        ordered_reader_.reset(new OrderedPairReader(cmd_info_->in_file_name1_, cmd_info_->in_file_name2_,
+                              my_rank, comm_size, chunk_bytes, swqc_window_bytes("SWQC_INPUT_WINDOW_MIB")));
+        const char *preload = getenv("SWQC_PRELOAD_INPUT");
+        uint64_t replay_pairs = strtoull(getenv("SWQC_REPLAY_PAIRS"), NULL, 10);
+        if (replay_pairs) {
+            try {
+                ordered_reader_->replay(cmd_info_->in_file_name1_, cmd_info_->in_file_name2_,
+                    replay_pairs, strtoull(getenv("SWQC_REPLAY_COPIES"), NULL, 10),
+                    size_t(strtoul(getenv("SWQC_REPLAY_LIMIT_MIB"), NULL, 10)) << 20,
+                    getenv("SWQC_REPLAY_LAYOUT"),
+                    size_t(strtoul(getenv("SWQC_REPLAY_BLOCK_CHUNKS"), NULL, 10)),
+                    strtoull(getenv("SWQC_REPLAY_SEED"), NULL, 10));
+            } catch (const std::exception &e) {
+                fprintf(stderr, "[SWQC replay] rank=%d error=%s\n", my_rank, e.what());
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+            fflush(stderr);
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
+        if (preload && strcmp(preload, "1") == 0) {
+            size_t limit = size_t(strtoul(getenv("SWQC_PRELOAD_LIMIT_MIB"), NULL, 10)) << 20;
+            try {
+                ordered_reader_->preload(limit, borrow_input);
+            } catch (const std::bad_alloc &) {
+                swqc_io_fail("cannot allocate real input preload payload");
+            }
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
+    }
+    /* Copy-only helpers are unnecessary during disk preload. */
+    if (memory_workers > 1 && swqc_host_memory_init(memory_workers) != 0)
+        swqc_io_fail("host memory helper initialization failed");
+    swqc_log_fprintf(stderr, "[SWQC host memory] rank=%d workers=%d dispatch=%s\n",
+            my_rank, memory_workers, memory_workers > 1 ? "poll" : "serial");
+    swqc_log_begin();
     double ttt = GetTime();
 
 
     //tagg
 
-    thread producer(bind(&PeQc::ProducerPeFastqTask64, this, cmd_info_->in_file_name1_, cmd_info_->in_file_name2_, fastqPool));
+    thread producer([&] {
+        try { ProducerPeFastqTask64(cmd_info_->in_file_name1_, cmd_info_->in_file_name2_, fastqPool); }
+        catch (const std::exception &e) { swqc_io_fail(e.what()); }
+    });
     thread consumer(bind(&PeQc::ConsumerPeFastqTask64, this, p_thread_info, fastqPool));
 
     if (cmd_info_->write_data_) {
-        WriteSeFastqTask12();
-        printf("write%d done\n", my_rank);
+        try { WriteSeFastqTask12(); }
+        catch (const std::exception &e) { swqc_io_fail(e.what()); }
+        swqc_log_printf("write%d done\n", my_rank);
     }
 
 
     consumer.join();
-    printf("consumer%d done\n", my_rank);
+    swqc_log_printf("consumer%d done\n", my_rank);
 
     producer.join();
-    printf("producer%d done\n", my_rank);
+    swqc_log_printf("producer%d done\n", my_rank);
+    ordered_reader_.reset();
+    gzip_reader_.reset();
+    // The writer can still have a final compression batch after QC completes.
+    swqc_runtime_finish();
+    // Helpers outlive both producer teardown and the final CPE task.
+    swqc_host_io_destroy();
+    serial_stages_.report(my_rank);
 
 
-    printf("rank%d all pro done1\n", my_rank);
+    swqc_log_printf("rank%d all pro done1\n", my_rank);
     MPI_Barrier(MPI_COMM_WORLD);
-    printf("rank%d all pro done2\n", my_rank);
+    swqc_log_printf("rank%d all pro done2\n", my_rank);
 
 
 #ifdef Verbose
-    printf("all thread done\n");
-    printf("now merge thread info\n");
+    swqc_log_printf("all thread done\n");
+    swqc_log_printf("now merge thread info\n");
 #endif
 
-    printf("TOT TIME1 %lf\n", GetTime() - ttt);
+    double pipeline_seconds = GetTime() - ttt;
+    swqc_log_fprintf(stderr, "[SWQC rank %d] pipeline_seconds=%.6f\n", my_rank, pipeline_seconds);
+    swqc_log_end();
+    printf("TOT TIME1 %lf\n", pipeline_seconds);
 
     double tt00 = GetTime();
     vector<State *> pre_vec_state1;
@@ -1944,7 +1945,6 @@ void PeQc::ProcessPeFastq() {
     } else {
         string pre_state_is = pre_state_tmp1->ParseString();
         State* tmp_state = new State(pre_state_is.c_str(), pre_state_is.length(), cmd_info_, cmd_info_->seq_len_, cmd_info_->qul_range_, false);
-        //bool res = checkStates(pre_state_tmp1, tmp_state);
         //if(!res) cerr << "GGGGGGGG" << endl;
         int now_size = pre_state_is.length();
         MPI_Send(&now_size, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
@@ -1965,7 +1965,6 @@ void PeQc::ProcessPeFastq() {
     } else {
         string pre_state_is = pre_state_tmp2->ParseString();
         State* tmp_state = new State(pre_state_is.c_str(), pre_state_is.length(), cmd_info_, cmd_info_->seq_len_, cmd_info_->qul_range_, false);
-        //bool res = checkStates(pre_state_tmp2, tmp_state);
         //if(!res) cerr << "GGGGGGGG" << endl;
         int now_size = pre_state_is.length();
         MPI_Send(&now_size, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);

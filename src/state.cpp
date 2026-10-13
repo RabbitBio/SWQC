@@ -40,8 +40,8 @@ State::State(CmdInfo *cmd_info, int seq_len, int qul_range, bool is_read2) {
     has_summarize_ = false;
     pos_cnt_ = new int[malloc_seq_len_ * 4];
     memset(pos_cnt_, 0, malloc_seq_len_ * 4 * sizeof(int));
-    pos_qul_ = new int[malloc_seq_len_];
-    memset(pos_qul_, 0, malloc_seq_len_ * sizeof(int));
+    pos_qul_ = new int64_t[malloc_seq_len_];
+    memset(pos_qul_, 0, malloc_seq_len_ * sizeof(int64_t));
     len_cnt_ = new int[malloc_seq_len_];
     memset(len_cnt_, 0, malloc_seq_len_ * sizeof(int));
     gc_cnt_ = new int[gcMax + 100];
@@ -49,7 +49,7 @@ State::State(CmdInfo *cmd_info, int seq_len, int qul_range, bool is_read2) {
     qul_cnt_ = new int[qul_range_];
     memset(qul_cnt_, 0, qul_range_ * sizeof(int));
 
-    //kmer_buf_len_ = 2 << (5 * 2);
+    kmer_buf_len_ = 0;
     //kmer_ = new int64_t[kmer_buf_len_];
     //memset(kmer_, 0, sizeof(int64_t) * kmer_buf_len_);
     //TODO
@@ -150,8 +150,8 @@ State::State(const char *info, int info_len, CmdInfo *cmd_info, int seq_len, int
     has_summarize_ = false;
     pos_cnt_ = new int[malloc_seq_len_ * 4];
     memset(pos_cnt_, 0, malloc_seq_len_ * 4 * sizeof(int));
-    pos_qul_ = new int[malloc_seq_len_];
-    memset(pos_qul_, 0, malloc_seq_len_ * sizeof(int));
+    pos_qul_ = new int64_t[malloc_seq_len_];
+    memset(pos_qul_, 0, malloc_seq_len_ * sizeof(int64_t));
     len_cnt_ = new int[malloc_seq_len_];
     memset(len_cnt_, 0, malloc_seq_len_ * sizeof(int));
     gc_cnt_ = new int[gcMax + 100];
@@ -219,13 +219,15 @@ State::State(const char *info, int info_len, CmdInfo *cmd_info, int seq_len, int
     trim_adapter_bases_ = getInt64(info, pos, info_len);
 
     //pos_qul
+    if (real_seq_len_ == 0 && pos < info_len && info[pos] == '$') ++pos;
     for(int i = 0; i < real_seq_len_; i++) {
-        pos_qul_[i] = getInt(info, pos, info_len); 
+        pos_qul_[i] = getInt64(info, pos, info_len);
     }
     if(info[pos - 1] != '$') {
         printf("%c GG\n", info[pos - 1]);
     }
     //len_cnt
+    if (real_seq_len_ == 0 && pos < info_len && info[pos] == '$') ++pos;
     for(int i = 0; i < real_seq_len_; i++) {
         len_cnt_[i] = getInt(info, pos, info_len);
     }
@@ -233,6 +235,7 @@ State::State(const char *info, int info_len, CmdInfo *cmd_info, int seq_len, int
         printf("%c GG\n", info[pos - 1]);
     }
     //pos_cnt
+    if (real_seq_len_ == 0 && pos < info_len && info[pos] == '$') ++pos;
     for(int i = 0; i < real_seq_len_; i++) {
         for(int j = 0; j < 4; j++) {
             pos_cnt_[i * 4 + j] = getInt(info, pos, info_len); 
@@ -339,20 +342,20 @@ void State::ExtendBuffer(int old_len, int new_len) {
     newBuf = new int[new_len * 4];
     memset(newBuf, 0, sizeof(int) * new_len * 4);
     memcpy(newBuf, pos_cnt_, sizeof(int) * old_len * 4);
-    delete pos_cnt_;
+    delete[] pos_cnt_;
     pos_cnt_ = newBuf;
 
-    newBuf = new int[new_len];
-    memset(newBuf, 0, sizeof(int) * new_len);
-    memcpy(newBuf, pos_qul_, sizeof(int) * old_len);
-    delete pos_qul_;
-    pos_qul_ = newBuf;
+    int64_t *newQul = new int64_t[new_len];
+    memset(newQul, 0, sizeof(int64_t) * new_len);
+    memcpy(newQul, pos_qul_, sizeof(int64_t) * old_len);
+    delete[] pos_qul_;
+    pos_qul_ = newQul;
 
 
     newBuf = new int[new_len];
     memset(newBuf, 0, sizeof(int) * new_len);
     memcpy(newBuf, len_cnt_, sizeof(int) * old_len);
-    delete len_cnt_;
+    delete[] len_cnt_;
     len_cnt_ = newBuf;
 }
 /*
@@ -403,10 +406,8 @@ void State::StateInfo(neoReference &ref) {
     len_cnt_[slen - 1]++;
     char *bases = reinterpret_cast<char *>(ref.base + ref.pseq);
     char *quals = reinterpret_cast<char *>(ref.base + ref.pqual);
-    int flag = 4;
     int gc_cnt = 0;
     int qul_tot = 0;
-    int kmer = 0;
     int phredSub = 33;
     if (cmd_info_->isPhred64_) phredSub = 64;
     for (int i = 0; i < slen; i++) {
@@ -421,13 +422,9 @@ void State::StateInfo(neoReference &ref) {
         } else if (q >= 20) {
             q20bases_++;
         }
-        pos_cnt_[i * 4 + valAGCT[b]]++;
+        const int base_index = valAGCT[b];
+        if (base_index >= 0) pos_cnt_[i * 4 + base_index]++;
         pos_qul_[i] += q;
-        if (bases[i] == 'N') flag = 5;
-        int val = valAGCT[b];
-        kmer = ((kmer << 2) & 0x3FC) | val;
-        if (flag <= 0) kmer_[kmer]++;
-        flag--;
     }
 
     tot_bases_ += slen;
@@ -517,22 +514,24 @@ string State::ParseString() {
     res += "@" + to_string(trim_adapter_bases_);
     res += "$";
     //pos_qul
-    res += to_string(pos_qul_[0]);
+    if (real_seq_len_ > 0) res += to_string(pos_qul_[0]);
     for(int i = 1; i < real_seq_len_; i++) {
         res += "@" + to_string(pos_qul_[i]);
     }
     res += "$";
     //len_cnt
-    res += to_string(len_cnt_[0]);
+    if (real_seq_len_ > 0) res += to_string(len_cnt_[0]);
     for(int i = 1; i < real_seq_len_; i++) {
         res += "@" + to_string(len_cnt_[i]);
     }
     res += "$";
     //pos_cnt
-    res += to_string(pos_cnt_[0]);
-    res += "@" + to_string(pos_cnt_[1]);
-    res += "@" + to_string(pos_cnt_[2]);
-    res += "@" + to_string(pos_cnt_[3]);
+    if (real_seq_len_ > 0) {
+        res += to_string(pos_cnt_[0]);
+        res += "@" + to_string(pos_cnt_[1]);
+        res += "@" + to_string(pos_cnt_[2]);
+        res += "@" + to_string(pos_cnt_[3]);
+    }
     for(int i = 1; i < real_seq_len_; i++) {
         for(int j = 0; j < 4; j++) {
             res += "@" + to_string(pos_cnt_[i * 4 + j]);
@@ -852,7 +851,7 @@ int State::GetKmerBufLen() const {
     return kmer_buf_len_;
 }
 
-int *State::GetPosQul() const {
+int64_t *State::GetPosQul() const {
     return pos_qul_;
 }
 

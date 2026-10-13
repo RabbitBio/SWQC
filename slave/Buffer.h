@@ -13,6 +13,7 @@
 #define BUFFER_H
 
 #include <algorithm>
+#include <memory>
 #include "Globals.h"
 //#include "utils.h"
 
@@ -52,6 +53,8 @@ namespace rabbit {
             byte *buffer;
 #endif
             uint64 size;
+            bool owns_buffer; // Matches the MPE Buffer ABI; CPE only borrows it.
+            std::shared_ptr<void> view_owner; // MPE owns/releases the lease.
         };
 
 /**

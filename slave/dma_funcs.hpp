@@ -1,4 +1,25 @@
 #pragma once
+#if !SWQC_MANUAL_LDM
+#include <cstring>
+template <typename TM, typename TL>
+inline void dma_getn(TM *mem, TL *local, int count) {
+    static_assert(sizeof(TM) == sizeof(TL), "copy element width mismatch");
+    if (count > 0) std::memcpy(local, mem, size_t(count) * sizeof(TL));
+}
+template <typename TM, typename TL>
+inline void dma_putn(TM *mem, TL *local, int count) {
+    static_assert(sizeof(TM) == sizeof(TL), "copy element width mismatch");
+    if (count > 0) std::memcpy(mem, local, size_t(count) * sizeof(TL));
+}
+template <typename TM, typename TL>
+inline void dma_get(TM *mem, TL *local, int bytes) {
+    if (bytes > 0) std::memcpy(local, mem, bytes);
+}
+template <typename TM, typename TL>
+inline void dma_put(TM *mem, TL *local, int bytes) {
+    if (bytes > 0) std::memcpy(mem, local, bytes);
+}
+#else
 #include <sys/cdefs.h>
 #ifndef __lsp_clang__
 #define __sw_ocn__
@@ -109,3 +130,4 @@ __always_inline __attribute__((__artificial__)) void dma_put(TM *mem, TL *ldm, i
       : "memory");
   #endif
 }
+#endif

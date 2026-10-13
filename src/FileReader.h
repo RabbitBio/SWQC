@@ -105,6 +105,7 @@ namespace rabbit {
         //igzip usage
         unsigned char *mIgInbuf = NULL;
         bool isZipped = false;
+        bool standard_gzip_ = false;
         bool eof = false;
         std::ifstream iff_idx;
         bool iff_idx_end;

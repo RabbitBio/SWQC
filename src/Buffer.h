@@ -13,6 +13,7 @@
 #define BUFFER_H
 
 #include <algorithm>
+#include <memory>
 #include "Globals.h"
 #include "utils.h"
 
@@ -28,19 +29,41 @@ namespace rabbit {
         class Buffer {
         public:
             Buffer(uint64 size_) {
-                ASSERT(size_ != 0);
+                owns_buffer = true;
 
 #if (USE_64BIT_MEMORY)
                 uint64 size64 = size_ / 8;
                 if (size64 * 8 < size_) size64 += 1;
-                buffer = new uint64[size64];
+                buffer = size64 ? new uint64[size64] : NULL;
 #else
-                buffer = new byte[size_];
+                buffer = size_ ? new byte[size_] : NULL;
 #endif
                 size = size_;
             }
 
-            ~Buffer() { delete buffer; }
+            ~Buffer() { if (owns_buffer) delete[] buffer; }
+
+            // An optional lease keeps decoded storage alive through QC and writing.
+            void SetView(byte *data, uint64 bytes, std::shared_ptr<void> owner = {}) {
+                if (owns_buffer) delete[] buffer;
+                view_owner = std::move(owner);
+#if (USE_64BIT_MEMORY)
+                buffer = reinterpret_cast<uint64 *>(data);
+#else
+                buffer = data;
+#endif
+                size = bytes;
+                owns_buffer = false;
+            }
+
+            void ResetView() {
+                if (!owns_buffer) {
+                    buffer = NULL;
+                    size = 0;
+                    owns_buffer = true;
+                    view_owner.reset();
+                }
+            }
 
             uint64 Size() const { return size; }
 
@@ -55,6 +78,20 @@ namespace rabbit {
 
             /// resize the buffer
             void Extend(uint64 size_, bool copy_ = false) {
+                if (!owns_buffer) {
+                    uint64 bytes = std::max(size, size_);
+#if (USE_64BIT_MEMORY)
+                    uint64 *p = new uint64[(bytes + 7) / 8];
+#else
+                    byte *p = new byte[bytes];
+#endif
+                    if (copy_) std::copy(Pointer(), Pointer() + size, (byte *)p);
+                    buffer = p;
+                    size = bytes;
+                    owns_buffer = true;
+                    view_owner.reset();
+                    return;
+                }
 #if (USE_64BIT_MEMORY)
                 uint64 size64 = size / 8;
                 if (size64 * 8 < size) size64 += 1;
@@ -89,6 +126,8 @@ namespace rabbit {
             void Swap(Buffer &b) {
                 TSwap(b.buffer, buffer);
                 TSwap(b.size, size);
+                TSwap(b.owns_buffer, owns_buffer);
+                view_owner.swap(b.view_owner);
             }
 
         private:
@@ -102,6 +141,8 @@ namespace rabbit {
             byte *buffer;
 #endif
             uint64 size;
+            bool owns_buffer;
+            std::shared_ptr<void> view_owner;
         };
 
 /**
@@ -121,6 +162,7 @@ namespace rabbit {
             DataChunk(const uint64 bufferSize_ = DefaultBufferSize) : data(bufferSize_), size(0) {}
 
             void Reset() {
+                data.ResetView();
                 size = 0;
                 next = NULL;
             }
